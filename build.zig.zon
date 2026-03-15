@@ -1,0 +1,14 @@
+.{
+    .name = .anywindow,
+    .fingerprint = 0x2ba6fe46fef1f9fb,
+    .version = "0.0.0",
+    .paths = .{"src"},
+    .dependencies = .{
+        .windows = .{
+            .path = "../mir-win32",
+        },
+        .x11 = .{
+            .path = "../mir-x11",
+        },
+    },
+}

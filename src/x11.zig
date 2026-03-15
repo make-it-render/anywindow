@@ -1,0 +1,646 @@
+pub const WindowManager = struct {
+    allocator: std.mem.Allocator,
+
+    conn: std.net.Stream,
+    atoms: Atoms,
+    info: x11.Setup,
+    xid: x11.XID,
+
+    net_writer_buffer: []u8,
+    net_writer: *std.net.Stream.Writer,
+
+    events: queue.ThreadSafeQueue(common.Event),
+    reader_thread: ?std.Thread = null,
+    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    scaling: f32,
+
+    keysym_map: []u32,
+    keysyms_per_keycode: u8,
+    min_keycode: u8,
+    max_keycode: u8,
+
+    pub fn init(allocator: std.mem.Allocator) !@This() {
+        const conn = try x11.connect(.{});
+
+        const info = try x11.setup(allocator, conn);
+        errdefer info.deinit();
+
+        const xid = x11.XID.init(info.resource_id_base, info.resource_id_mask);
+
+        const atoms = Atoms{
+            .atom = try x11.internAtom(conn, "ATOM"),
+            .cardinal = try x11.internAtom(conn, "CARDINAL"),
+            .string = try x11.internAtom(conn, "STRING"),
+            .wm_name = try x11.internAtom(conn, "WM_NAME"),
+            .wm_protocols = try x11.internAtom(conn, "WM_PROTOCOLS"),
+            .wm_delete_window = try x11.internAtom(conn, "WM_DELETE_WINDOW"),
+            .net_wm_state = try x11.internAtom(conn, "_NET_WM_STATE"),
+            .net_wm_state_fullscreen = try x11.internAtom(conn, "_NET_WM_STATE_FULLSCREEN"),
+            .net_wm_icon = try x11.internAtom(conn, "_NET_WM_ICON"),
+        };
+
+        const net_writer_buffer: []u8 = try allocator.alloc(u8, 4 * 1024);
+        errdefer allocator.free(net_writer_buffer);
+        const net_writer = try allocator.create(std.net.Stream.Writer);
+        errdefer allocator.destroy(net_writer);
+        net_writer.* = conn.writer(net_writer_buffer);
+
+        const scaling = getDesktopScaling(allocator) catch 1.0;
+
+        // Query keyboard mapping
+        const min_kc = info.min_keycode;
+        const max_kc = info.max_keycode;
+        const kc_count = max_kc - min_kc + 1;
+
+        try x11.send(conn, x11.proto.GetKeyboardMapping{
+            .first_keycode = min_kc,
+            .count = kc_count,
+        });
+
+        var reply_buffer: [32]u8 = undefined;
+        var conn_reader = conn.reader(&reply_buffer);
+        var reader = conn_reader.interface();
+
+        const kb_reply = try x11.utils.readReply(reader, x11.proto.GetKeyboardMappingReply);
+
+        var keysyms_per_keycode: u8 = 0;
+        var keysym_map: []u32 = &[_]u32{};
+
+        if (kb_reply) |r| {
+            keysyms_per_keycode = r.keysyms_per_keycode;
+            const total_keysyms: u32 = @as(u32, kc_count) * @as(u32, keysyms_per_keycode);
+            keysym_map = try allocator.alloc(u32, total_keysyms);
+            errdefer allocator.free(keysym_map);
+
+            const keysym_bytes = std.mem.sliceAsBytes(keysym_map);
+            try reader.readSliceAll(keysym_bytes);
+        }
+
+        return .{
+            .allocator = allocator,
+            .conn = conn,
+            .info = info,
+            .xid = xid,
+            .atoms = atoms,
+
+            .net_writer_buffer = net_writer_buffer,
+            .net_writer = net_writer,
+
+            .scaling = scaling,
+
+            .keysym_map = keysym_map,
+            .keysyms_per_keycode = keysyms_per_keycode,
+            .min_keycode = min_kc,
+            .max_keycode = max_kc,
+
+            .events = .{},
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        self.shutdown.store(true, .release);
+        self.events.close();
+        if (self.reader_thread) |t| t.join();
+        self.allocator.free(self.keysym_map);
+        self.conn.close();
+        self.info.deinit();
+        self.allocator.free(self.net_writer_buffer);
+        self.allocator.destroy(self.net_writer);
+    }
+
+    pub fn createWindow(self: *@This(), options: common.WindowOptions) !Window {
+        return try Window.init(self, options);
+    }
+
+    pub fn receive(self: *@This()) !?common.Event {
+        if (self.reader_thread == null) {
+            self.reader_thread = std.Thread.spawn(.{}, readerRun, .{self}) catch return error.ThreadSpawnError;
+        }
+        return self.events.receive();
+    }
+
+    /// Unblock any thread waiting in receive() so it returns null.
+    pub fn stop(self: *@This()) void {
+        self.shutdown.store(true, .release);
+        self.events.close();
+    }
+
+    fn readerRun(self: *@This()) void {
+        defer self.events.close();
+        while (!self.shutdown.load(.acquire)) {
+            const event = self.receive0() catch break;
+            switch (event) {
+                .nop => continue,
+                else => self.events.push(event),
+            }
+        }
+    }
+
+    fn receive0(self: *@This()) !common.Event {
+        if (try x11.receive(self.conn)) |message| {
+            switch (message) {
+                .Expose => |expose| {
+                    return .{
+                        .draw = .{
+                            .window_id = expose.window_id,
+                            .area = common.BBox{
+                                .x = 0,
+                                .y = 0,
+                                .width = 0,
+                                .height = 0,
+                            },
+                        },
+                    };
+                },
+                .ClientMessage => |client_message| {
+                    const client_message_data = x11.clientMessageData(client_message);
+                    if (client_message_data.u32[0] == self.atoms.wm_delete_window) {
+                        return .{ .close = client_message.window_id };
+                    }
+                    return .{ .nop = {} };
+                },
+                .KeyRelease => |key_release| {
+                    const evdev_code = key_release.keycode -| 8;
+                    const sc = keys.evdevToScancode(evdev_code);
+                    const keysym = self.lookupKeysym(key_release.keycode, key_release.state);
+                    const key = keys.x11KeysymToKey(keysym);
+                    const mods = x11ModsFromState(key_release.state);
+                    return .{
+                        .key_released = .{
+                            .scancode = sc,
+                            .key = key,
+                            .modifiers = mods,
+                            .window_id = key_release.event_window,
+                        },
+                    };
+                },
+                .KeyPress => |key_press| {
+                    const evdev_code = key_press.keycode -| 8;
+                    const sc = keys.evdevToScancode(evdev_code);
+                    const keysym = self.lookupKeysym(key_press.keycode, key_press.state);
+                    const key = keys.x11KeysymToKey(keysym);
+                    const mods = x11ModsFromState(key_press.state);
+                    return .{
+                        .key_pressed = .{
+                            .scancode = sc,
+                            .key = key,
+                            .modifiers = mods,
+                            .window_id = key_press.event_window,
+                        },
+                    };
+                },
+                .ButtonRelease => |button_release| {
+                    return .{
+                        .mouse_released = .{
+                            .window_id = button_release.event_window,
+                            .x = button_release.event_x,
+                            .y = button_release.event_y,
+                            .button = button_release.keycode,
+                        },
+                    };
+                },
+                .ButtonPress => |button_press| {
+                    return .{
+                        .mouse_pressed = .{
+                            .window_id = button_press.event_window,
+                            .x = button_press.event_x,
+                            .y = button_press.event_y,
+                            .button = button_press.keycode,
+                        },
+                    };
+                },
+                .MotionNotify => |motion_notify| {
+                    return .{
+                        .mouse_moved = .{
+                            .x = motion_notify.event_x,
+                            .y = motion_notify.event_y,
+                            .window_id = motion_notify.event_window,
+                        },
+                    };
+                },
+                .ConfigureNotify => |configure| {
+                    return .{
+                        .resize = .{
+                            .width = configure.width,
+                            .height = configure.height,
+                            .window_id = configure.window_id,
+                        },
+                    };
+                },
+                else => {
+                    return .{ .nop = {} };
+                },
+            }
+        } else {
+            return .{ .nop = {} };
+        }
+    }
+
+    pub fn flush(self: *@This()) !void {
+        self.net_writer.interface.flush() catch |err| {
+            if (self.net_writer.err) |net_err| {
+                log.err("Net error: {any}", .{net_err});
+                return net_err;
+            } else {
+                log.err("Writer error: {any}", .{err});
+                return err;
+            }
+        };
+    }
+
+    pub fn lookupKeysym(self: *@This(), keycode: u8, state: u16) u32 {
+        if (keycode < self.min_keycode or keycode > self.max_keycode) return 0;
+        const offset = keycode - self.min_keycode;
+        const base: usize = @as(usize, offset) * @as(usize, self.keysyms_per_keycode);
+        if (base >= self.keysym_map.len) return 0;
+
+        // Column 0 = unshifted, column 1 = shifted
+        const shifted = (state & 0x01) != 0; // Shift bit in KeyButMask
+        const col: usize = if (shifted and self.keysyms_per_keycode > 1) 1 else 0;
+        const idx = base + col;
+        if (idx >= self.keysym_map.len) return 0;
+
+        const sym = self.keysym_map[idx];
+        // If shifted column is NoSymbol (0), fall back to unshifted
+        if (sym == 0 and col == 1) return self.keysym_map[base];
+        return sym;
+    }
+};
+
+pub const Window = struct {
+    window_id: u32,
+    wm: *WindowManager,
+
+    scaling: f32,
+
+    status: common.WindowStatus,
+
+    depth: u8,
+    root: u32,
+    graphic_context_id: u32,
+
+    // to know if clear request comes after a redraw
+    redrawn: bool = false,
+
+    pub fn init(wm: *WindowManager, options: common.WindowOptions) !@This() {
+        const window_id = try wm.xid.genID();
+        const event_masks = [_]x11.proto.EventMask{
+            .Exposure,
+            .StructureNotify,
+            .SubstructureNotify,
+            .PropertyChange,
+            .KeyPress,
+            .KeyRelease,
+            .ButtonPress,
+            .ButtonRelease,
+            .PointerMotion,
+        };
+        const window_values = x11.proto.WindowValue{
+            .BackgroundPixel = commonPixelToX11Pixel(options.background),
+            .EventMask = x11.mask(&event_masks),
+            .Colormap = wm.info.screens[0].colormap,
+        };
+        const create_window = x11.proto.CreateWindow{
+            .window_id = window_id,
+
+            .parent_id = wm.info.screens[0].root,
+            .visual_id = wm.info.screens[0].root_visual,
+            .depth = wm.info.screens[0].root_depth,
+
+            .x = options.x orelse 10,
+            .y = options.y orelse 10,
+            .width = options.width orelse 640,
+            .height = options.height orelse 480,
+            .border_width = 0,
+            .window_class = .InputOutput,
+
+            .value_mask = x11.maskFromValues(x11.proto.WindowMask, window_values),
+        };
+        try x11.sendWithValues(wm.conn, create_window, window_values);
+
+        const set_name_req = x11.proto.ChangeProperty{
+            .window_id = window_id,
+            .property = wm.atoms.wm_name,
+            .property_type = wm.atoms.string,
+            .length_of_data = @intCast(options.title.len),
+        };
+        try x11.sendWithBytes(wm.conn, set_name_req, options.title);
+
+        const set_protocols = x11.proto.ChangeProperty{
+            .window_id = window_id,
+            .property = wm.atoms.wm_protocols,
+            .property_type = wm.atoms.atom,
+            .format = 32,
+            .length_of_data = 1,
+        };
+        try x11.sendWithBytes(wm.conn, set_protocols, &std.mem.toBytes(wm.atoms.wm_delete_window));
+
+        const graphic_context_id = try wm.xid.genID();
+        const graphic_context_values = x11.proto.GraphicContextValue{
+            .Background = wm.info.screens[0].black_pixel,
+            .Foreground = wm.info.screens[0].white_pixel,
+        };
+
+        const create_gc = x11.proto.CreateGraphicContext{
+            .graphic_context_id = graphic_context_id,
+            .drawable_id = window_id,
+            .value_mask = x11.maskFromValues(x11.proto.GraphicContextMask, graphic_context_values),
+        };
+        try x11.sendWithValues(wm.conn, create_gc, graphic_context_values);
+
+        return .{
+            .window_id = window_id,
+            .wm = wm,
+            .status = .open,
+
+            .root = wm.info.screens[0].root,
+            .depth = wm.info.screens[0].root_depth,
+            .graphic_context_id = graphic_context_id,
+
+            .scaling = wm.scaling,
+        };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        x11.send(self.wm.conn, x11.proto.DestroyWindow{ .window_id = self.window_id }) catch |err| {
+            log.err("Error destroying window: {any}", .{err});
+        };
+    }
+
+    pub fn close(self: *@This()) void {
+        x11.send(self.wm.conn, x11.proto.UnmapWindow{ .window_id = self.window_id }) catch |err| {
+            log.err("Error unmapping window: {any}", .{err});
+        };
+        self.status = .closed;
+    }
+
+    pub fn show(self: *@This()) !void {
+        const map_req = x11.proto.MapWindow{ .window_id = self.window_id };
+        try x11.send(self.wm.conn, map_req);
+    }
+
+    pub fn toggleFullscreen(self: *@This()) void {
+        const msg = x11.proto.ClientMessageEvent{
+            .window_id = self.window_id,
+            .message_type = self.wm.atoms.net_wm_state,
+            .data = .{ 2, self.wm.atoms.net_wm_state_fullscreen, 0, 0, 0 },
+        };
+
+        const send_event = x11.proto.SendEvent{
+            .destination = self.root,
+            .event_mask = x11.mask(&[_]x11.proto.EventMask{ .SubstructureNotify, .SubstructureRedirect }),
+            .event = std.mem.toBytes(msg),
+        };
+        x11.send(self.wm.conn, send_event) catch |err| {
+            log.err("Error sending fullscreen toggle: {any}", .{err});
+        };
+    }
+
+    pub fn setIcon(self: *@This(), icon: common.Icon) !void {
+        // _NET_WM_ICON format: width (u32), height (u32), ARGB pixels (u32 each)
+        const pixel_count = icon.width * icon.height;
+        const data_len = 2 + pixel_count;
+
+        const data = try self.wm.allocator.alloc(u32, data_len);
+        defer self.wm.allocator.free(data);
+
+        data[0] = icon.width;
+        data[1] = icon.height;
+
+        for (0..pixel_count) |i| {
+            const off = i * 4;
+            const a: u32 = icon.pixels[off + 3];
+            const r: u32 = icon.pixels[off + 0];
+            const g: u32 = icon.pixels[off + 1];
+            const b: u32 = icon.pixels[off + 2];
+            data[2 + i] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+
+        const set_icon_req = x11.proto.ChangeProperty{
+            .window_id = self.window_id,
+            .property = self.wm.atoms.net_wm_icon,
+            .property_type = self.wm.atoms.cardinal,
+            .format = 32,
+            .length_of_data = @intCast(data_len),
+        };
+        try x11.sendWithBytes(self.wm.conn, set_icon_req, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn createImage(self: *@This(), size: common.Size) !Image {
+        return Image.init(self, size);
+    }
+
+    pub fn clear(self: *@This(), area: common.BBox) !void {
+        if (self.redrawn) return;
+        self.redrawn = false;
+
+        const clear_area = x11.proto.ClearArea{
+            .window_id = self.window_id,
+            .x = area.x,
+            .y = area.y,
+            .height = area.height,
+            .width = area.width,
+        };
+
+        try x11.write(&self.wm.net_writer.interface, clear_area);
+        //try x11.send(self.wm.conn, clear_area);
+    }
+
+    pub fn redraw(self: *@This(), area: common.BBox) !void {
+        const clear_area = x11.proto.ClearArea{
+            .window_id = self.window_id,
+            .x = area.x,
+            .y = area.y,
+            .height = area.height,
+            .width = area.width,
+            .exposures = true,
+        };
+        _ = clear_area;
+        // sending fake redraw event;
+        //try x11.send(self.wm.conn, clear_area);
+        //self.redrawn = true;
+        self.wm.events.push(
+            .{
+                .draw = .{
+                    .window_id = self.window_id,
+                },
+            },
+        );
+    }
+
+    pub fn beginDraw(_: *@This()) !void {}
+
+    pub fn endDraw(self: *@This()) !void {
+        try self.wm.flush();
+    }
+};
+
+pub const Image = struct {
+    window: *Window,
+    image_id: u32,
+    size: common.Size,
+
+    pub fn init(window: *Window, size: common.Size) !@This() {
+        const pixmap_id = try window.wm.xid.genID();
+
+        const pixmap_req = x11.proto.CreatePixmap{
+            .pixmap_id = pixmap_id,
+            .drawable_id = window.window_id,
+            .width = size.width,
+            .height = size.height,
+            .depth = window.depth,
+        };
+
+        try x11.write(&window.wm.net_writer.interface, pixmap_req);
+
+        return .{
+            .image_id = pixmap_id,
+            .window = window,
+            .size = size,
+        };
+    }
+
+    pub fn setPixels(self: @This(), pixels: []const u8) !void {
+        const image_info = x11.getImageInfo(self.window.wm.info, self.window.root);
+        const row_bytes: usize = @as(usize, self.size.width) * 4;
+        const max_rows: u16 = if (row_bytes == 0) self.size.height else @intCast(@min(self.size.height, 65535 / row_bytes));
+        if (max_rows == 0) return;
+
+        var y: u16 = 0;
+        while (y < self.size.height) {
+            const strip_height: u16 = @intCast(@min(max_rows, self.size.height - y));
+            const strip_offset = @as(usize, y) * row_bytes;
+            const strip_len = @as(usize, strip_height) * row_bytes;
+            const strip_pixels = pixels[strip_offset..][0..strip_len];
+
+            var reader = std.Io.Reader.fixed(strip_pixels);
+            var pixmap_reader = x11.RgbaToZPixmapReader.init(image_info, &reader);
+
+            const put_image_req = x11.proto.PutImage{
+                .drawable_id = self.image_id,
+                .graphic_context_id = self.window.graphic_context_id,
+                .width = self.size.width,
+                .height = strip_height,
+                .x = 0,
+                .y = @intCast(y),
+                .depth = self.window.depth,
+            };
+
+            try x11.stream(
+                &self.window.wm.net_writer.interface,
+                put_image_req,
+                (&pixmap_reader).interface(),
+                strip_len,
+            );
+
+            y += strip_height;
+        }
+    }
+
+    pub fn draw(self: @This(), target: common.BBox) !void {
+        const copy_area_req = x11.proto.CopyArea{
+            .src_drawable_id = self.image_id,
+            .dst_drawable_id = self.window.window_id,
+            .graphic_context_id = self.window.graphic_context_id,
+            .width = target.width,
+            .height = target.height,
+            .dst_x = target.x,
+            .dst_y = target.y,
+        };
+        try x11.write(&self.window.wm.net_writer.interface, copy_area_req);
+        //try x11.send(self.window.wm.conn, copy_area_req);
+    }
+
+    pub fn deinit(self: @This()) void {
+        const free_image_req = x11.proto.FreePixmap{
+            .pixmap_id = self.image_id,
+        };
+        //x11.write(&self.window.wm.net_writer.interface, free_image_req);
+        x11.send(self.window.wm.conn, free_image_req) catch |err| {
+            log.err("Failed to free image: {any}", .{err});
+        };
+    }
+};
+
+/// RGB to ABGR
+fn commonPixelToX11Pixel(src: [3]u8) u32 {
+    const dst: [4]u8 = [4]u8{ 1, src[2], src[1], src[0] };
+    return std.mem.bytesToValue(u32, &dst);
+}
+
+fn getDesktopScaling(allocator: std.mem.Allocator) !f32 {
+    var scaling: f32 = 1.0;
+
+    const conn = try x11.connect(.{});
+    defer conn.close();
+
+    const info = try x11.setup(allocator, conn);
+    defer info.deinit();
+
+    const string = try x11.internAtom(conn, "STRING");
+
+    const resource_manager = try x11.internAtom(conn, "RESOURCE_MANAGER");
+    try x11.send(conn, x11.proto.GetProperty{
+        .window_id = info.screens[0].root,
+        .property = resource_manager,
+        .property_type = string,
+        .long_length = 1024,
+    });
+    const resource_reply = try x11.receiveReply(conn, x11.proto.GetPropertyReply);
+
+    if (resource_reply) |r| {
+        if (r.value_len > 4096) {
+            // Skip oversized response
+            return scaling / 96;
+        }
+        const tmp = try allocator.alloc(u8, r.value_len);
+        defer allocator.free(tmp);
+        _ = try conn.read(tmp);
+
+        var reader = std.Io.Reader.fixed(tmp);
+        while (try reader.takeDelimiter('\n')) |line| {
+            if (std.mem.startsWith(u8, line, "Xft.dpi:")) {
+                var split = std.mem.splitScalar(u8, line, ':');
+                _ = split.first();
+                if (split.next()) |value| {
+                    const trimmed = std.mem.trim(u8, value, " \t");
+                    scaling = try std.fmt.parseFloat(f32, trimmed);
+                    break;
+                }
+            }
+        }
+    }
+
+    return scaling / 96;
+}
+fn x11ModsFromState(state: u16) common.Modifiers {
+    return .{
+        .shift = (state & 0x01) != 0, // ShiftMask
+        .control = (state & 0x04) != 0, // ControlMask
+        .alt = (state & 0x08) != 0, // Mod1Mask (typically Alt)
+        .super = (state & 0x40) != 0, // Mod4Mask (typically Super)
+        .caps_lock = (state & 0x02) != 0, // LockMask
+        .num_lock = (state & 0x10) != 0, // Mod2Mask (typically NumLock)
+    };
+}
+
+const Atoms = struct {
+    atom: u32,
+    cardinal: u32,
+    string: u32,
+    wm_name: u32,
+    wm_protocols: u32,
+    wm_delete_window: u32,
+    net_wm_state: u32,
+    net_wm_state_fullscreen: u32,
+    net_wm_icon: u32,
+};
+
+const std = @import("std");
+const x11 = @import("x11");
+const common = @import("common.zig");
+const queue = @import("queue.zig");
+const keys = @import("keys.zig");
+
+const log = std.log.scoped(.any_x11);
