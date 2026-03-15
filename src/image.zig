@@ -10,6 +10,7 @@ platform_size: common.Size,
 scaling: f32,
 allocator: std.mem.Allocator,
 
+/// Initialize an image with the given source dimensions, bound to a window.
 pub fn init(allocator: std.mem.Allocator, window: *Window, source_size: common.Size) @This() {
     return .{
         .platform_image = null,
@@ -22,11 +23,13 @@ pub fn init(allocator: std.mem.Allocator, window: *Window, source_size: common.S
     };
 }
 
+/// Release the platform image and source pixel buffer.
 pub fn deinit(self: *@This()) void {
     if (self.platform_image) |pi| pi.deinit();
     if (self.source_pixels) |sp| self.allocator.free(sp);
 }
 
+/// Copy RGBA pixel data into the source buffer.
 pub fn setPixels(self: *@This(), pixels: []const u8) !void {
     const len = @as(usize, self.source_size.width) * self.source_size.height * 4;
     if (self.source_pixels == null) {
@@ -35,6 +38,7 @@ pub fn setPixels(self: *@This(), pixels: []const u8) !void {
     @memcpy(self.source_pixels.?, pixels[0..len]);
 }
 
+/// Scale and draw the image into the given target rectangle.
 pub fn draw(self: *@This(), target: common.BBox) !void {
     const src = self.source_pixels orelse return;
 
@@ -71,11 +75,13 @@ pub fn draw(self: *@This(), target: common.BBox) !void {
     try self.platform_image.?.draw(phys_target);
 }
 
-pub fn width(self: *const @This()) u16 {
+/// Return the source image width.
+pub fn width(self: @This()) u16 {
     return self.source_size.width;
 }
 
-pub fn height(self: *const @This()) u16 {
+/// Return the source image height.
+pub fn height(self: @This()) u16 {
     return self.source_size.height;
 }
 
