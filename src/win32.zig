@@ -37,6 +37,7 @@ pub const WindowManager = struct {
 
     pub fn flush(_: *@This()) !void {
         _ = win.DwmFlush();
+        _ = win.GdiFlush();
     }
 };
 
@@ -275,6 +276,8 @@ pub const Window = struct {
         }
 
         _ = win.ReleaseDC(self.handle, self.window_dc);
+        _ = win.PostMessageW(self.handle, 0, 0, 0);
+
         self.window_dc = null;
         self.display = null;
         self.backbuffer = null;
