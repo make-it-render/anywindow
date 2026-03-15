@@ -4,21 +4,20 @@
 
 platform_image: ?PlatformImage,
 window: *Window,
-source_size: common.Size,
-source_pixels: ?[]u8,
-platform_size: common.Size,
-scaling: f32,
+size: common.Size,
+pixels: []u8,
 allocator: std.mem.Allocator,
 
 /// Initialize an image with the given source dimensions, bound to a window.
-pub fn init(allocator: std.mem.Allocator, window: *Window, source_size: common.Size) @This() {
+pub fn init(allocator: std.mem.Allocator, window: *Window, size: common.Size) !@This() {
+    const len = @as(usize, size.width) * size.height * 4;
+    const pixels = try allocator.alloc(u8, len);
+    @memset(pixels, 0);
     return .{
         .platform_image = null,
         .window = window,
-        .source_size = source_size,
-        .source_pixels = null,
-        .platform_size = .{},
-        .scaling = window.scaling,
+        .size = size,
+        .pixels = pixels,
         .allocator = allocator,
     };
 }
@@ -26,46 +25,39 @@ pub fn init(allocator: std.mem.Allocator, window: *Window, source_size: common.S
 /// Release the platform image and source pixel buffer.
 pub fn deinit(self: *@This()) void {
     if (self.platform_image) |pi| pi.deinit();
-    if (self.source_pixels) |sp| self.allocator.free(sp);
+    self.allocator.free(self.pixels);
 }
 
 /// Copy RGBA pixel data into the source buffer.
-pub fn setPixels(self: *@This(), pixels: []const u8) !void {
-    const len = @as(usize, self.source_size.width) * self.source_size.height * 4;
-    if (self.source_pixels == null) {
-        self.source_pixels = try self.allocator.alloc(u8, len);
-    }
-    @memcpy(self.source_pixels.?, pixels[0..len]);
+pub fn setPixels(self: *@This(), pixels: []const u8) void {
+    const len = @as(usize, self.size.width) * self.size.height * 4;
+    @memcpy(self.pixels, pixels[0..len]);
 }
 
 /// Scale and draw the image into the given target rectangle.
 pub fn draw(self: *@This(), target: common.BBox) !void {
-    const src = self.source_pixels orelse return;
-
-    const phys_width = scaleU16(target.width, self.scaling);
-    const phys_height = scaleU16(target.height, self.scaling);
+    const phys_width = scaleU16(target.width, self.window.scaling);
+    const phys_height = scaleU16(target.height, self.window.scaling);
     const phys_target = common.BBox{
-        .x = scaleI16(target.x, self.scaling),
-        .y = scaleI16(target.y, self.scaling),
+        .x = scaleI16(target.x, self.window.scaling),
+        .y = scaleI16(target.y, self.window.scaling),
         .width = phys_width,
         .height = phys_height,
     };
 
     const needed_size = common.Size{ .width = phys_width, .height = phys_height };
     if (self.platform_image == null or
-        self.platform_size.width != needed_size.width or
-        self.platform_size.height != needed_size.height)
+        !std.meta.eql(self.platform_image.?.size, needed_size))
     {
         if (self.platform_image) |pi| pi.deinit();
         self.platform_image = try self.window.createImage(needed_size);
-        self.platform_size = needed_size;
     }
 
     const scaled = try nearestNeighbor(
         self.allocator,
-        src,
-        self.source_size.width,
-        self.source_size.height,
+        self.pixels,
+        self.size.width,
+        self.size.height,
         phys_width,
         phys_height,
     );
@@ -73,16 +65,6 @@ pub fn draw(self: *@This(), target: common.BBox) !void {
 
     try self.platform_image.?.setPixels(scaled);
     try self.platform_image.?.draw(phys_target);
-}
-
-/// Return the source image width.
-pub fn width(self: @This()) u16 {
-    return self.source_size.width;
-}
-
-/// Return the source image height.
-pub fn height(self: @This()) u16 {
-    return self.source_size.height;
 }
 
 fn scaleU16(v: u16, scaling: f32) u16 {

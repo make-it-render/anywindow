@@ -26,9 +26,9 @@ pub fn main() !void {
     };
     const pixels = std.mem.toBytes(yellow_block);
 
-    var image = win.Image.init(allocator, &window, .{ .width = 5, .height = 5 });
+    var image = try win.Image.init(allocator, &window, .{ .width = 5, .height = 5 });
     defer image.deinit();
-    try image.setPixels(&pixels);
+    image.setPixels(&pixels);
 
     var timer = try std.time.Timer.start();
 
