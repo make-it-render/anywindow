@@ -26,10 +26,9 @@ pub fn main() !void {
     };
     const pixels = std.mem.toBytes(yellow_block);
 
-    var image = try window.createImage(.{ .height = 5, .width = 5 });
+    var image = win.Image.init(allocator, &window, .{ .width = 5, .height = 5 });
     defer image.deinit();
     try image.setPixels(&pixels);
-    try wm.flush();
 
     var timer = try std.time.Timer.start();
 
@@ -45,13 +44,7 @@ pub fn main() !void {
 
                 try window.beginDraw();
 
-                const target = win.BBox{
-                    .x = 100,
-                    .y = 100,
-                    .height = image.size.height,
-                    .width = image.size.width,
-                };
-                try image.draw(target);
+                try image.draw(.{ .x = 100, .y = 100, .width = 50, .height = 50 });
 
                 try window.endDraw();
 

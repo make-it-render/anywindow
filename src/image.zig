@@ -1,79 +1,90 @@
-//! A positioned image with DPI scaling.
+//! A scaled image with DPI scaling.
 //! Wraps the platform image with logical coordinates, applying
-//! nearest-neighbor scaling when the window has a scaling factor.
+//! nearest-neighbor scaling at draw time to any target size.
 
-platform_image: PlatformImage,
+platform_image: ?PlatformImage,
 window: *Window,
-bbox: common.BBox,
+source_size: common.Size,
+source_pixels: ?[]u8,
+platform_size: common.Size,
 scaling: f32,
 allocator: std.mem.Allocator,
 
-pub fn init(allocator: std.mem.Allocator, window: *Window, bbox: common.BBox) !@This() {
-    const s = window.scaling;
-
-    const phys_width = scale(bbox.width, s);
-    const phys_height = scale(bbox.height, s);
-
-    const platform_image = try window.createImage(.{ .width = phys_width, .height = phys_height });
-
+pub fn init(allocator: std.mem.Allocator, window: *Window, source_size: common.Size) @This() {
     return .{
-        .platform_image = platform_image,
+        .platform_image = null,
         .window = window,
-        .bbox = bbox,
-        .scaling = s,
+        .source_size = source_size,
+        .source_pixels = null,
+        .platform_size = .{},
+        .scaling = window.scaling,
         .allocator = allocator,
     };
 }
 
 pub fn deinit(self: *@This()) void {
-    self.platform_image.deinit();
+    if (self.platform_image) |pi| pi.deinit();
+    if (self.source_pixels) |sp| self.allocator.free(sp);
 }
 
 pub fn setPixels(self: *@This(), pixels: []const u8) !void {
-    if (self.scaling == 1.0) {
-        try self.platform_image.setPixels(pixels);
-    } else {
-        const phys_width = scale(self.bbox.width, self.scaling);
-        const phys_height = scale(self.bbox.height, self.scaling);
-        const scaled = try nearestNeighbor(
-            self.allocator,
-            pixels,
-            self.bbox.width,
-            self.bbox.height,
-            phys_width,
-            phys_height,
-        );
-        defer self.allocator.free(scaled);
-        try self.platform_image.setPixels(scaled);
+    const len = @as(usize, self.source_size.width) * self.source_size.height * 4;
+    if (self.source_pixels == null) {
+        self.source_pixels = try self.allocator.alloc(u8, len);
     }
+    @memcpy(self.source_pixels.?, pixels[0..len]);
 }
 
-pub fn draw(self: *@This()) !void {
-    try self.platform_image.draw(.{
-        .x = scale(self.bbox.x, self.scaling),
-        .y = scale(self.bbox.y, self.scaling),
-        .width = scale(self.bbox.width, self.scaling),
-        .height = scale(self.bbox.height, self.scaling),
-    });
-}
+pub fn draw(self: *@This(), target: common.BBox) !void {
+    const src = self.source_pixels orelse return;
 
-pub fn setX(self: *@This(), x: common.X) void {
-    self.bbox.x = x;
-}
+    const phys_width = scaleU16(target.width, self.scaling);
+    const phys_height = scaleU16(target.height, self.scaling);
+    const phys_target = common.BBox{
+        .x = scaleI16(target.x, self.scaling),
+        .y = scaleI16(target.y, self.scaling),
+        .width = phys_width,
+        .height = phys_height,
+    };
 
-pub fn setY(self: *@This(), y: common.Y) void {
-    self.bbox.y = y;
+    const needed_size = common.Size{ .width = phys_width, .height = phys_height };
+    if (self.platform_image == null or
+        self.platform_size.width != needed_size.width or
+        self.platform_size.height != needed_size.height)
+    {
+        if (self.platform_image) |pi| pi.deinit();
+        self.platform_image = try self.window.createImage(needed_size);
+        self.platform_size = needed_size;
+    }
+
+    const scaled = try nearestNeighbor(
+        self.allocator,
+        src,
+        self.source_size.width,
+        self.source_size.height,
+        phys_width,
+        phys_height,
+    );
+    defer self.allocator.free(scaled);
+
+    try self.platform_image.?.setPixels(scaled);
+    try self.platform_image.?.draw(phys_target);
 }
 
 pub fn width(self: *const @This()) u16 {
-    return self.bbox.width;
+    return self.source_size.width;
 }
 
 pub fn height(self: *const @This()) u16 {
-    return self.bbox.height;
+    return self.source_size.height;
 }
 
-fn scale(v: anytype, scaling: f32) @TypeOf(v) {
+fn scaleU16(v: u16, scaling: f32) u16 {
+    if (scaling == 1.0) return v;
+    return @intFromFloat(@as(f32, @floatFromInt(v)) * scaling);
+}
+
+fn scaleI16(v: i16, scaling: f32) i16 {
     if (scaling == 1.0) return v;
     return @intFromFloat(@as(f32, @floatFromInt(v)) * scaling);
 }
