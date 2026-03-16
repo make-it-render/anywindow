@@ -85,22 +85,43 @@ fn nearestNeighbor(
     dst_width: common.Width,
     dst_height: common.Height,
 ) ![]u8 {
+    const src_w: usize = src_width;
+    const src_h: usize = src_height;
+    const dst_w: usize = dst_width;
+    const dst_h: usize = dst_height;
+
     const y_ratio: f64 = @as(f64, @floatFromInt(src_height)) / @as(f64, @floatFromInt(dst_height));
     const x_ratio: f64 = @as(f64, @floatFromInt(src_width)) / @as(f64, @floatFromInt(dst_width));
 
-    const dst_pixels = try allocator.alloc(u8, @as(usize, dst_width) * dst_height * 4);
+    const dst_pixels = try allocator.alloc(u8, dst_w * dst_h * 4);
 
-    var dst_y: usize = 0;
-    while (dst_y < dst_height) : (dst_y += 1) {
+    // Precompute source X index for each destination column
+    const col_map = try allocator.alloc(usize, dst_w);
+    defer allocator.free(col_map);
+    for (0..dst_w) |dst_x| {
+        col_map[dst_x] = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_x)) * x_ratio)), src_w -| 1);
+    }
+
+    for (0..dst_h) |dst_y| {
+        const mapped_src_y = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_y)) * y_ratio)), src_h -| 1);
+        const src_row_start: usize = mapped_src_y * src_w * 4;
+        const dst_row_start: usize = dst_y * dst_w * 4;
+
         var dst_x: usize = 0;
-        while (dst_x < dst_width) : (dst_x += 1) {
-            const src_x = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_x)) * x_ratio)), @as(usize, src_width) -| 1);
-            const src_y = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_y)) * y_ratio)), @as(usize, src_height) -| 1);
+        while (dst_x < dst_w) {
+            const mapped_src_x = col_map[dst_x];
+            const src_pixel = src[src_row_start + mapped_src_x * 4 ..][0..4];
 
-            const src_idx = (src_y * src_width + src_x) * 4;
-            const dst_idx = (dst_y * dst_width + dst_x) * 4;
+            // Find run of consecutive dst pixels mapping to the same src pixel
+            var run_end = dst_x + 1;
+            while (run_end < dst_w and col_map[run_end] == mapped_src_x) : (run_end += 1) {}
 
-            @memcpy(dst_pixels[dst_idx..][0..4], src[src_idx..][0..4]);
+            // Fill run with same pixel (LLVM auto-vectorizes to wide stores)
+            for (dst_x..run_end) |col| {
+                dst_pixels[dst_row_start + col * 4 ..][0..4].* = src_pixel.*;
+            }
+
+            dst_x = run_end;
         }
     }
 
