@@ -427,8 +427,12 @@ pub const Window = struct {
         try x11.sendWithBytes(self.wm.conn, set_icon_req, std.mem.sliceAsBytes(data));
     }
 
-    pub fn createImage(self: *@This(), size: common.Size) !Image {
-        return Image.init(self, size);
+    pub fn createImage(self: *@This(), allocator: std.mem.Allocator, size: common.Size) !Image {
+        return Image.init(allocator, self, size);
+    }
+
+    pub fn destroyImage(_: *@This(), image: *Image) void {
+        image.deinit();
     }
 
     pub fn clear(self: *@This(), area: common.BBox) !void {
@@ -478,38 +482,93 @@ pub const Window = struct {
 
 pub const Image = struct {
     window: *Window,
-    image_id: u32,
-    size: common.Size,
+    allocator: std.mem.Allocator,
+    source_size: common.Size,
+    pixels: []u8,
+    pixmap_id: ?u32 = null,
+    pixmap_size: common.Size = .{ .width = 0, .height = 0 },
 
-    pub fn init(window: *Window, size: common.Size) !@This() {
-        const pixmap_id = try window.wm.xid.genID();
-
-        const pixmap_req = x11.proto.CreatePixmap{
-            .pixmap_id = pixmap_id,
-            .drawable_id = window.window_id,
-            .width = size.width,
-            .height = size.height,
-            .depth = window.depth,
-        };
-
-        try x11.write(&window.wm.net_writer.interface, pixmap_req);
-
+    pub fn init(allocator: std.mem.Allocator, window: *Window, size: common.Size) !@This() {
+        const len = @as(usize, size.width) * size.height * 4;
+        const pixels = try allocator.alloc(u8, len);
+        @memset(pixels, 0);
         return .{
-            .image_id = pixmap_id,
             .window = window,
-            .size = size,
+            .allocator = allocator,
+            .source_size = size,
+            .pixels = pixels,
         };
     }
 
-    pub fn setPixels(self: @This(), pixels: []const u8) !void {
+    pub fn setPixels(self: *@This(), pixels: []const u8) void {
+        const len = @as(usize, self.source_size.width) * self.source_size.height * 4;
+        @memcpy(self.pixels, pixels[0..len]);
+    }
+
+    pub fn draw(self: *@This(), target: common.BBox) !void {
+        const phys_width = scaleU16(target.width, self.window.scaling);
+        const phys_height = scaleU16(target.height, self.window.scaling);
+        const phys_target = common.BBox{
+            .x = scaleI16(target.x, self.window.scaling),
+            .y = scaleI16(target.y, self.window.scaling),
+            .width = phys_width,
+            .height = phys_height,
+        };
+
+        const needed_size = common.Size{ .width = phys_width, .height = phys_height };
+        if (self.pixmap_id == null or
+            !std.meta.eql(self.pixmap_size, needed_size))
+        {
+            if (self.pixmap_id) |pid| {
+                x11.send(self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
+                    log.err("Failed to free image: {any}", .{err});
+                };
+            }
+            const pixmap_id = try self.window.wm.xid.genID();
+            try x11.write(&self.window.wm.net_writer.interface, x11.proto.CreatePixmap{
+                .pixmap_id = pixmap_id,
+                .drawable_id = self.window.window_id,
+                .width = phys_width,
+                .height = phys_height,
+                .depth = self.window.depth,
+            });
+            self.pixmap_id = pixmap_id;
+            self.pixmap_size = needed_size;
+        }
+
+        const scaled = try nearestNeighbor(
+            self.allocator,
+            self.pixels,
+            self.source_size.width,
+            self.source_size.height,
+            phys_width,
+            phys_height,
+        );
+        defer self.allocator.free(scaled);
+
+        try self.uploadPixels(scaled);
+
+        const copy_area_req = x11.proto.CopyArea{
+            .src_drawable_id = self.pixmap_id.?,
+            .dst_drawable_id = self.window.window_id,
+            .graphic_context_id = self.window.graphic_context_id,
+            .width = phys_target.width,
+            .height = phys_target.height,
+            .dst_x = phys_target.x,
+            .dst_y = phys_target.y,
+        };
+        try x11.write(&self.window.wm.net_writer.interface, copy_area_req);
+    }
+
+    fn uploadPixels(self: @This(), pixels: []const u8) !void {
         const image_info = x11.getImageInfo(self.window.wm.info, self.window.root);
-        const row_bytes: usize = @as(usize, self.size.width) * 4;
-        const max_rows: u16 = if (row_bytes == 0) self.size.height else @intCast(@min(self.size.height, 65535 / row_bytes));
+        const row_bytes: usize = @as(usize, self.pixmap_size.width) * 4;
+        const max_rows: u16 = if (row_bytes == 0) self.pixmap_size.height else @intCast(@min(self.pixmap_size.height, 65535 / row_bytes));
         if (max_rows == 0) return;
 
         var y: u16 = 0;
-        while (y < self.size.height) {
-            const strip_height: u16 = @intCast(@min(max_rows, self.size.height - y));
+        while (y < self.pixmap_size.height) {
+            const strip_height: u16 = @intCast(@min(max_rows, self.pixmap_size.height - y));
             const strip_offset = @as(usize, y) * row_bytes;
             const strip_len = @as(usize, strip_height) * row_bytes;
             const strip_pixels = pixels[strip_offset..][0..strip_len];
@@ -518,9 +577,9 @@ pub const Image = struct {
             var pixmap_reader = x11.RgbaToZPixmapReader.init(image_info, &reader);
 
             const put_image_req = x11.proto.PutImage{
-                .drawable_id = self.image_id,
+                .drawable_id = self.pixmap_id.?,
                 .graphic_context_id = self.window.graphic_context_id,
-                .width = self.size.width,
+                .width = self.pixmap_size.width,
                 .height = strip_height,
                 .x = 0,
                 .y = @intCast(y),
@@ -538,30 +597,179 @@ pub const Image = struct {
         }
     }
 
-    pub fn draw(self: @This(), target: common.BBox) !void {
-        const copy_area_req = x11.proto.CopyArea{
-            .src_drawable_id = self.image_id,
-            .dst_drawable_id = self.window.window_id,
-            .graphic_context_id = self.window.graphic_context_id,
-            .width = target.width,
-            .height = target.height,
-            .dst_x = target.x,
-            .dst_y = target.y,
-        };
-        try x11.write(&self.window.wm.net_writer.interface, copy_area_req);
-        //try x11.send(self.window.wm.conn, copy_area_req);
-    }
-
-    pub fn deinit(self: @This()) void {
-        const free_image_req = x11.proto.FreePixmap{
-            .pixmap_id = self.image_id,
-        };
-        //x11.write(&self.window.wm.net_writer.interface, free_image_req);
-        x11.send(self.window.wm.conn, free_image_req) catch |err| {
-            log.err("Failed to free image: {any}", .{err});
-        };
+    pub fn deinit(self: *@This()) void {
+        if (self.pixmap_id) |pid| {
+            x11.send(self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
+                log.err("Failed to free image: {any}", .{err});
+            };
+        }
+        self.allocator.free(self.pixels);
     }
 };
+
+fn scaleU16(v: u16, scaling: f32) u16 {
+    if (scaling == 1.0) return v;
+    return @intFromFloat(@as(f32, @floatFromInt(v)) * scaling);
+}
+
+fn scaleI16(v: i16, scaling: f32) i16 {
+    if (scaling == 1.0) return v;
+    return @intFromFloat(@as(f32, @floatFromInt(v)) * scaling);
+}
+
+fn nearestNeighbor(
+    allocator: std.mem.Allocator,
+    src: []const u8,
+    src_width: common.Width,
+    src_height: common.Height,
+    dst_width: common.Width,
+    dst_height: common.Height,
+) ![]u8 {
+    const src_w: usize = src_width;
+    const src_h: usize = src_height;
+    const dst_w: usize = dst_width;
+    const dst_h: usize = dst_height;
+
+    const y_ratio: f64 = @as(f64, @floatFromInt(src_height)) / @as(f64, @floatFromInt(dst_height));
+    const x_ratio: f64 = @as(f64, @floatFromInt(src_width)) / @as(f64, @floatFromInt(dst_width));
+
+    const dst_pixels = try allocator.alloc(u8, dst_w * dst_h * 4);
+
+    // Precompute source X index for each destination column
+    const col_map = try allocator.alloc(usize, dst_w);
+    defer allocator.free(col_map);
+    for (0..dst_w) |dst_x| {
+        col_map[dst_x] = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_x)) * x_ratio)), src_w -| 1);
+    }
+
+    for (0..dst_h) |dst_y| {
+        const mapped_src_y = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_y)) * y_ratio)), src_h -| 1);
+        const src_row_start: usize = mapped_src_y * src_w * 4;
+        const dst_row_start: usize = dst_y * dst_w * 4;
+
+        var dst_x: usize = 0;
+        while (dst_x < dst_w) {
+            const mapped_src_x = col_map[dst_x];
+            const src_pixel = src[src_row_start + mapped_src_x * 4 ..][0..4];
+
+            // Find run of consecutive dst pixels mapping to the same src pixel
+            var run_end = dst_x + 1;
+            while (run_end < dst_w and col_map[run_end] == mapped_src_x) : (run_end += 1) {}
+
+            // Fill run with same pixel (LLVM auto-vectorizes to wide stores)
+            for (dst_x..run_end) |col| {
+                dst_pixels[dst_row_start + col * 4 ..][0..4].* = src_pixel.*;
+            }
+
+            dst_x = run_end;
+        }
+    }
+
+    return dst_pixels;
+}
+
+test "nearestNeighbor 2x upscale" {
+    const allocator = testing.allocator;
+
+    // 2x2 source image: red, green, blue, white
+    const src = [_]u8{
+        255, 0, 0, 255, // red
+        0, 255, 0, 255, // green
+        0, 0, 255, 255, // blue
+        255, 255, 255, 255, // white
+    };
+
+    // Scale 2x2 -> 4x4
+    const result = try nearestNeighbor(allocator, &src, 2, 2, 4, 4);
+    defer allocator.free(result);
+
+    // 4x4 = 16 pixels * 4 bytes = 64 bytes
+    try testing.expectEqual(@as(usize, 64), result.len);
+
+    // Top-left quadrant should be red (first pixel repeated)
+    try testing.expectEqualSlices(u8, &[_]u8{ 255, 0, 0, 255 }, result[0..4]); // (0,0)
+    try testing.expectEqualSlices(u8, &[_]u8{ 255, 0, 0, 255 }, result[4..8]); // (1,0)
+    try testing.expectEqualSlices(u8, &[_]u8{ 255, 0, 0, 255 }, result[16..20]); // (0,1)
+}
+
+test "nearestNeighbor identity (no scaling)" {
+    const allocator = testing.allocator;
+
+    // 2x2 source
+    const src = [_]u8{
+        1,  2,  3,  4,
+        5,  6,  7,  8,
+        9,  10, 11, 12,
+        13, 14, 15, 16,
+    };
+
+    // Same size: 2x2 -> 2x2
+    const result = try nearestNeighbor(allocator, &src, 2, 2, 2, 2);
+    defer allocator.free(result);
+
+    try testing.expectEqualSlices(u8, &src, result);
+}
+
+test "nearestNeighbor 2x downscale" {
+    const allocator = testing.allocator;
+
+    // 4x4 source image
+    const src = [_]u8{
+        // Row 0
+        255, 0, 0, 255, // red
+        255, 0, 0, 255, // red
+        0, 255, 0, 255, // green
+        0, 255, 0, 255, // green
+        // Row 1
+        255, 0, 0, 255, // red
+        255, 0, 0, 255, // red
+        0, 255, 0, 255, // green
+        0, 255, 0, 255, // green
+        // Row 2
+        0, 0, 255, 255, // blue
+        0, 0, 255, 255, // blue
+        255, 255, 255, 255, // white
+        255, 255, 255, 255, // white
+        // Row 3
+        0, 0, 255, 255, // blue
+        0, 0, 255, 255, // blue
+        255, 255, 255, 255, // white
+        255, 255, 255, 255, // white
+    };
+
+    // Scale 4x4 -> 2x2
+    const result = try nearestNeighbor(allocator, &src, 4, 4, 2, 2);
+    defer allocator.free(result);
+
+    // 2x2 = 4 pixels * 4 bytes = 16 bytes
+    try testing.expectEqual(@as(usize, 16), result.len);
+
+    // Should sample corners: red, green, blue, white
+    try testing.expectEqualSlices(u8, &[_]u8{ 255, 0, 0, 255 }, result[0..4]); // red
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 255, 0, 255 }, result[4..8]); // green
+    try testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 255, 255 }, result[8..12]); // blue
+    try testing.expectEqualSlices(u8, &[_]u8{ 255, 255, 255, 255 }, result[12..16]); // white
+}
+
+test "nearestNeighbor single pixel upscale" {
+    const allocator = testing.allocator;
+
+    // 1x1 source
+    const src = [_]u8{ 128, 64, 32, 255 };
+
+    // Scale 1x1 -> 3x3
+    const result = try nearestNeighbor(allocator, &src, 1, 1, 3, 3);
+    defer allocator.free(result);
+
+    // 3x3 = 9 pixels * 4 bytes = 36 bytes
+    try testing.expectEqual(@as(usize, 36), result.len);
+
+    // All pixels should be the same color
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        try testing.expectEqualSlices(u8, &src, result[i * 4 .. i * 4 + 4]);
+    }
+}
 
 /// RGB to ABGR
 fn commonPixelToX11Pixel(src: [3]u8) u32 {
@@ -638,6 +846,7 @@ const Atoms = struct {
 };
 
 const std = @import("std");
+const testing = std.testing;
 const x11 = @import("x11");
 const common = @import("common.zig");
 const queue = @import("queue.zig");

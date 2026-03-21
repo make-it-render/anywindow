@@ -214,8 +214,12 @@ pub const Window = struct {
         _ = win.SendMessageW(self.handle, win.WM_SETICON, win.ICON_SMALL, @intCast(@intFromPtr(hicon)));
     }
 
-    pub fn createImage(self: *@This(), size: common.Size) !Image {
-        return Image.init(self, size);
+    pub fn createImage(self: *@This(), allocator: std.mem.Allocator, size: common.Size) !Image {
+        return Image.init(allocator, self, size);
+    }
+
+    pub fn destroyImage(_: *@This(), image: *Image) void {
+        image.deinit();
     }
 
     pub fn clear(self: *@This(), _: common.BBox) !void {
@@ -286,79 +290,68 @@ pub const Window = struct {
 
 pub const Image = struct {
     window: *Window,
-    size: common.Size,
+    allocator: std.mem.Allocator,
+    source_size: common.Size,
+    pixels: []u8,
+    bitmap_info: win.BitmapInfo,
 
-    bitmap: win.Bitmap,
-    pixels: [*]u8,
-
-    pub fn init(window: *Window, size: common.Size) !@This() {
-        var pixels: [*]u8 = undefined;
-        const bitmap_info = win.BitmapInfo{
-            .header = .{
-                .width = size.width,
-                .height = @as(i32, size.height) * -1,
+    pub fn init(allocator: std.mem.Allocator, window: *Window, size: common.Size) !@This() {
+        const len = @as(usize, size.width) * size.height * 4;
+        const pixels = try allocator.alloc(u8, len);
+        @memset(pixels, 0);
+        return .{
+            .window = window,
+            .allocator = allocator,
+            .source_size = size,
+            .pixels = pixels,
+            .bitmap_info = .{
+                .header = .{
+                    .width = size.width,
+                    .height = @as(i32, size.height) * -1,
+                },
             },
         };
-
-        const bitmap = win.CreateDIBSection(
-            null,
-            &bitmap_info,
-            .RGB_COLORS,
-            &pixels,
-            null,
-            0,
-        );
-        if (bitmap == null) {
-            const err = win.GetLastError();
-            log.err("CreateDIBSection error: {any}", .{err});
-            return error.ErrorCreatingImage;
-        }
-
-        return .{
-            .bitmap = bitmap.?,
-            .window = window,
-            .size = size,
-            .pixels = pixels,
-        };
     }
 
-    pub fn setPixels(self: @This(), pixels: []const u8) !void {
-        const expected = @as(usize, self.size.width) * @as(usize, self.size.height) * 4;
-        if (pixels.len < expected) return error.InsufficientPixelData;
+    pub fn setPixels(self: *@This(), pixels: []const u8) void {
+        const len = @as(usize, self.source_size.width) * self.source_size.height * 4;
+        const src = pixels[0..len];
         var i: usize = 0;
-        while (i + 3 < pixels.len) : (i += 4) {
-            // RGB to BGR
-            self.pixels[i] = pixels[i + 2];
-            self.pixels[i + 1] = pixels[i + 1];
-            self.pixels[i + 2] = pixels[i];
-            self.pixels[i + 3] = pixels[i + 3];
+        while (i + 3 < len) : (i += 4) {
+            // RGBA to BGRA
+            self.pixels[i] = src[i + 2];
+            self.pixels[i + 1] = src[i + 1];
+            self.pixels[i + 2] = src[i];
+            self.pixels[i + 3] = src[i + 3];
         }
     }
 
-    pub fn draw(self: @This(), target: common.BBox) !void {
-        _ = win.SelectObject(self.window.frame, self.bitmap);
-
-        const bitBltResult = win.BitBlt(
+    pub fn draw(self: *@This(), target: common.BBox) !void {
+        const result = win.StretchDIBits(
             self.window.display,
             target.x,
             target.y,
             target.width,
             target.height,
-            self.window.frame,
             0,
             0,
+            self.source_size.width,
+            self.source_size.height,
+            self.pixels.ptr,
+            &self.bitmap_info,
+            .RGB_COLORS,
             .SRCCOPY,
         );
 
-        if (!bitBltResult) {
+        if (result == 0) {
             const err = win.GetLastError();
-            log.err("BitBlt error: {any}", .{err});
-            return error.ErrorBitBlt;
+            log.err("StretchDIBits error: {any}", .{err});
+            return error.ErrorStretchDIBits;
         }
     }
 
-    pub fn deinit(self: @This()) void {
-        _ = win.DeleteObject(self.bitmap);
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.pixels);
     }
 };
 

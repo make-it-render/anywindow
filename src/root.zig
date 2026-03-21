@@ -6,8 +6,6 @@ pub const queue = @import("queue.zig");
 pub const keys = @import("keys.zig");
 pub const any = @import("any.zig");
 
-pub const Image = @import("image.zig");
-
 pub const WindowID = common.WindowID;
 pub const Size = common.Size;
 pub const Position = common.Position;
@@ -26,7 +24,7 @@ pub const WindowStatus = common.WindowStatus;
 pub const Event = common.Event;
 
 pub const WindowManager = any.WindowManager;
-pub const PlatformImage = any.PlatformImage;
+pub const Image = any.Image;
 pub const Window = any.Window;
 
 const std = @import("std");
@@ -37,7 +35,6 @@ const builtin = @import("builtin");
 test {
     _ = common;
     _ = queue;
-    _ = Image;
     _ = x11;
     _ = win32;
     _ = keys;
