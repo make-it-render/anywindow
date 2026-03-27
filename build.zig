@@ -4,13 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const x11_dep = b.dependency("x11", .{
+    const x11_dep = b.dependency("z11", .{
         .target = target,
         .optimize = optimize,
     });
     const x11 = x11_dep.module("x11");
 
-    const windows_dep = b.dependency("windows", .{
+    const windows_dep = b.dependency("windowz", .{
         .target = target,
         .optimize = optimize,
     });

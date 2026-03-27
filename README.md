@@ -1,4 +1,4 @@
-# mir-anywindow
+# anywindow
 
 Cross-platform window management abstraction for Zig.
 
@@ -18,7 +18,7 @@ Provides a unified API over platform-specific backends using comptime dispatch.
 ### Install
 
 ```sh
-zig fetch --save git+https://github.com/make-it-render/mir-anywindow
+zig fetch --save git+https://github.com/make-it-render/anywindow
 ```
 
 ### build.zig
