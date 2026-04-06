@@ -15,6 +15,10 @@ pub const WindowManager = struct {
 
     scaling: f32,
 
+    cursor_font_id: u32 = 0,
+    invisible_cursor_id: u32 = 0,
+    system_cursors: [8]u32 = [_]u32{0} ** 8,
+
     keysym_map: []u32,
     keysyms_per_keycode: u8,
     min_keycode: u8,
@@ -26,7 +30,7 @@ pub const WindowManager = struct {
         const info = try x11.setup(allocator, conn);
         errdefer info.deinit();
 
-        const xid = x11.XID.init(info.resource_id_base, info.resource_id_mask);
+        var xid = x11.XID.init(info.resource_id_base, info.resource_id_mask);
 
         const atoms = Atoms{
             .atom = try x11.internAtom(conn, "ATOM"),
@@ -77,6 +81,42 @@ pub const WindowManager = struct {
             try reader.readSliceAll(keysym_bytes);
         }
 
+        // Open the X11 "cursor" font for standard cursor shapes
+        const cursor_font_id = try xid.genID();
+        const cursor_font_name = "cursor";
+        try x11.sendWithBytes(conn, x11.proto.OpenFont{
+            .length = undefined, // sendWithBytes recalculates this
+            .font_id = cursor_font_id,
+            .name_length = cursor_font_name.len,
+        }, cursor_font_name);
+
+        // Create a 1x1 invisible cursor for hideCursor()
+        const tmp_pixmap_id = try xid.genID();
+        try x11.send(conn, x11.proto.CreatePixmap{
+            .pixmap_id = tmp_pixmap_id,
+            .drawable_id = info.screens[0].root,
+            .width = 1,
+            .height = 1,
+            .depth = 1,
+        });
+
+        const invisible_cursor_id = try xid.genID();
+        try x11.send(conn, x11.proto.CreateCursor{
+            .cursor_id = invisible_cursor_id,
+            .source_pixmap = tmp_pixmap_id,
+            .mask_pixmap = tmp_pixmap_id,
+            .fore_red = 0,
+            .fore_green = 0,
+            .fore_blue = 0,
+            .back_red = 0,
+            .back_green = 0,
+            .back_blue = 0,
+            .x_hotspot = 0,
+            .y_hotspot = 0,
+        });
+
+        try x11.send(conn, x11.proto.FreePixmap{ .pixmap_id = tmp_pixmap_id });
+
         return .{
             .allocator = allocator,
             .conn = conn,
@@ -88,6 +128,9 @@ pub const WindowManager = struct {
             .net_writer = net_writer,
 
             .scaling = scaling,
+
+            .cursor_font_id = cursor_font_id,
+            .invisible_cursor_id = invisible_cursor_id,
 
             .keysym_map = keysym_map,
             .keysyms_per_keycode = keysyms_per_keycode,
@@ -102,6 +145,20 @@ pub const WindowManager = struct {
         self.shutdown.store(true, .release);
         self.events.close();
         if (self.reader_thread) |t| t.join();
+
+        // Free cursor resources
+        for (self.system_cursors) |cursor_id| {
+            if (cursor_id != 0) {
+                x11.send(self.conn, x11.proto.FreeCursor{ .cursor_id = cursor_id }) catch {};
+            }
+        }
+        if (self.invisible_cursor_id != 0) {
+            x11.send(self.conn, x11.proto.FreeCursor{ .cursor_id = self.invisible_cursor_id }) catch {};
+        }
+        if (self.cursor_font_id != 0) {
+            x11.send(self.conn, x11.proto.CloseFont{ .font_id = self.cursor_font_id }) catch {};
+        }
+
         self.allocator.free(self.keysym_map);
         self.conn.close();
         self.info.deinit();
@@ -191,24 +248,65 @@ pub const WindowManager = struct {
                     };
                 },
                 .ButtonRelease => |button_release| {
-                    return .{
-                        .mouse_released = .{
-                            .window_id = button_release.event_window,
-                            .x = button_release.event_x,
-                            .y = button_release.event_y,
-                            .button = button_release.keycode,
+                    switch (button_release.keycode) {
+                        4, 5, 6, 7 => return .{ .nop = {} },
+                        else => return .{
+                            .mouse_released = .{
+                                .window_id = button_release.event_window,
+                                .x = button_release.event_x,
+                                .y = button_release.event_y,
+                                .button = button_release.keycode,
+                            },
                         },
-                    };
+                    }
                 },
                 .ButtonPress => |button_press| {
-                    return .{
-                        .mouse_pressed = .{
-                            .window_id = button_press.event_window,
-                            .x = button_press.event_x,
-                            .y = button_press.event_y,
-                            .button = button_press.keycode,
+                    switch (button_press.keycode) {
+                        4 => return .{
+                            .mouse_scroll = .{
+                                .x = button_press.event_x,
+                                .y = button_press.event_y,
+                                .scroll_x = 0,
+                                .scroll_y = 1,
+                                .window_id = button_press.event_window,
+                            },
                         },
-                    };
+                        5 => return .{
+                            .mouse_scroll = .{
+                                .x = button_press.event_x,
+                                .y = button_press.event_y,
+                                .scroll_x = 0,
+                                .scroll_y = -1,
+                                .window_id = button_press.event_window,
+                            },
+                        },
+                        6 => return .{
+                            .mouse_scroll = .{
+                                .x = button_press.event_x,
+                                .y = button_press.event_y,
+                                .scroll_x = -1,
+                                .scroll_y = 0,
+                                .window_id = button_press.event_window,
+                            },
+                        },
+                        7 => return .{
+                            .mouse_scroll = .{
+                                .x = button_press.event_x,
+                                .y = button_press.event_y,
+                                .scroll_x = 1,
+                                .scroll_y = 0,
+                                .window_id = button_press.event_window,
+                            },
+                        },
+                        else => return .{
+                            .mouse_pressed = .{
+                                .window_id = button_press.event_window,
+                                .x = button_press.event_x,
+                                .y = button_press.event_y,
+                                .button = button_press.keycode,
+                            },
+                        },
+                    }
                 },
                 .MotionNotify => |motion_notify| {
                     return .{
@@ -279,6 +377,9 @@ pub const Window = struct {
     depth: u8,
     root: u32,
     graphic_context_id: u32,
+
+    cursor_visible: bool = true,
+    current_cursor: u32 = 0,
 
     // to know if clear request comes after a redraw
     redrawn: bool = false,
@@ -425,6 +526,67 @@ pub const Window = struct {
             .length_of_data = @intCast(data_len),
         };
         try x11.sendWithBytes(self.wm.conn, set_icon_req, std.mem.sliceAsBytes(data));
+    }
+
+    pub fn hideCursor(self: *@This()) void {
+        self.cursor_visible = false;
+        const values = x11.proto.WindowValue{ .Cursor = self.wm.invisible_cursor_id };
+        x11.sendWithValues(self.wm.conn, x11.proto.ChangeWindowAttributes{
+            .window_id = self.window_id,
+            .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
+        }, values) catch {};
+    }
+
+    pub fn showCursor(self: *@This()) void {
+        self.cursor_visible = true;
+        const cursor_id = if (self.current_cursor != 0) self.current_cursor else @as(u32, 0);
+        const values = x11.proto.WindowValue{ .Cursor = cursor_id };
+        x11.sendWithValues(self.wm.conn, x11.proto.ChangeWindowAttributes{
+            .window_id = self.window_id,
+            .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
+        }, values) catch {};
+    }
+
+    pub fn setCursor(self: *@This(), cursor: common.Cursor) void {
+        const index = @intFromEnum(cursor);
+        if (self.wm.system_cursors[index] == 0) {
+            const glyph = cursorGlyph(cursor);
+            const cursor_id = self.wm.xid.genID() catch return;
+            x11.send(self.wm.conn, x11.proto.CreateGlyphCursor{
+                .cursor_id = cursor_id,
+                .source_font = self.wm.cursor_font_id,
+                .mask_font = self.wm.cursor_font_id,
+                .source_char = glyph,
+                .mask_char = glyph + 1,
+                .fore_red = 0,
+                .fore_green = 0,
+                .fore_blue = 0,
+                .back_red = 0xFFFF,
+                .back_green = 0xFFFF,
+                .back_blue = 0xFFFF,
+            }) catch return;
+            self.wm.system_cursors[index] = cursor_id;
+        }
+        self.current_cursor = self.wm.system_cursors[index];
+        if (self.cursor_visible) {
+            const values = x11.proto.WindowValue{ .Cursor = self.current_cursor };
+            x11.sendWithValues(self.wm.conn, x11.proto.ChangeWindowAttributes{
+                .window_id = self.window_id,
+                .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
+            }, values) catch {};
+        }
+    }
+
+    pub fn grabCursor(self: *@This()) void {
+        x11.send(self.wm.conn, x11.proto.GrabPointer{
+            .grab_window = self.window_id,
+            .confine_to = self.window_id,
+            .event_mask = @intCast(x11.mask(&[_]x11.proto.EventMask{ .ButtonPress, .ButtonRelease, .PointerMotion })),
+        }) catch {};
+    }
+
+    pub fn releaseCursor(self: *@This()) void {
+        x11.send(self.wm.conn, x11.proto.UngrabPointer{}) catch {};
     }
 
     pub fn createImage(self: *@This(), allocator: std.mem.Allocator, size: common.Size) !Image {
@@ -769,6 +931,19 @@ test "nearestNeighbor single pixel upscale" {
     while (i < 9) : (i += 1) {
         try testing.expectEqualSlices(u8, &src, result[i * 4 .. i * 4 + 4]);
     }
+}
+
+fn cursorGlyph(cursor: common.Cursor) u16 {
+    return switch (cursor) {
+        .default => 2,
+        .hand => 58,
+        .crosshair => 34,
+        .text => 152,
+        .not_allowed => 0,
+        .resize_ns => 116,
+        .resize_ew => 108,
+        .move => 52,
+    };
 }
 
 /// RGB to ABGR

@@ -73,6 +73,13 @@ pub const Event = union(enum) {
         y: Y,
         window_id: WindowID,
     },
+    mouse_scroll: struct {
+        x: X,
+        y: Y,
+        scroll_x: f32,
+        scroll_y: f32,
+        window_id: WindowID,
+    },
     key_pressed: struct {
         scancode: Scancode,
         key: Key,
@@ -90,6 +97,17 @@ pub const Event = union(enum) {
         height: Height,
         window_id: WindowID,
     },
+};
+
+pub const Cursor = enum {
+    default,
+    hand,
+    crosshair,
+    text,
+    not_allowed,
+    resize_ns,
+    resize_ew,
+    move,
 };
 
 pub const keys = @import("keys.zig");

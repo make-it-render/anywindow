@@ -50,8 +50,61 @@ pub fn main() !void {
 
                 log.info("Time to draw: {d}ms", .{timer.lap() / std.time.ns_per_ms});
             },
-            .mouse_pressed, .mouse_released, .key_pressed, .key_released => {
-                log.debug("{any}", .{event});
+            .key_pressed => |kp| {
+                switch (kp.key) {
+                    .@"1" => {
+                        window.setCursor(.default);
+                        log.info("cursor: default", .{});
+                    },
+                    .@"2" => {
+                        window.setCursor(.hand);
+                        log.info("cursor: hand", .{});
+                    },
+                    .@"3" => {
+                        window.setCursor(.crosshair);
+                        log.info("cursor: crosshair", .{});
+                    },
+                    .@"4" => {
+                        window.setCursor(.text);
+                        log.info("cursor: text", .{});
+                    },
+                    .@"5" => {
+                        window.setCursor(.not_allowed);
+                        log.info("cursor: not_allowed", .{});
+                    },
+                    .@"6" => {
+                        window.setCursor(.resize_ns);
+                        log.info("cursor: resize_ns", .{});
+                    },
+                    .@"7" => {
+                        window.setCursor(.resize_ew);
+                        log.info("cursor: resize_ew", .{});
+                    },
+                    .@"8" => {
+                        window.setCursor(.move);
+                        log.info("cursor: move", .{});
+                    },
+                    .h => {
+                        window.hideCursor();
+                        log.info("cursor: hidden", .{});
+                    },
+                    .s => {
+                        window.showCursor();
+                        log.info("cursor: shown", .{});
+                    },
+                    .g => {
+                        window.grabCursor();
+                        log.info("cursor: grabbed", .{});
+                    },
+                    .r => {
+                        window.releaseCursor();
+                        log.info("cursor: released", .{});
+                    },
+                    else => {},
+                }
+                try window.redraw(.{});
+            },
+            .mouse_pressed, .mouse_released, .key_released => {
                 try window.redraw(.{});
             },
             else => {},

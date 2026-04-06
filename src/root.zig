@@ -1,4 +1,3 @@
-
 pub const x11 = @import("x11.zig");
 pub const win32 = @import("win32.zig");
 pub const common = @import("common.zig");
@@ -40,4 +39,3 @@ test {
     _ = keys;
     _ = any;
 }
-

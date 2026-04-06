@@ -60,6 +60,10 @@ pub const Window = struct {
 
     scaling: f32 = 1.0,
 
+    // Cursor state
+    cursor_visible: bool = true,
+    current_cursor: ?win.CursorHandler = null,
+
     // fullscreen state
     is_fullscreen: bool = false,
     saved_style: isize = 0,
@@ -71,15 +75,16 @@ pub const Window = struct {
         defer wm.allocator.free(class_name_n);
 
         const class_name = try win.W(wm.allocator, class_name_n);
-        const cursor = win.LoadCursorW(null, .Arrow);
         const background = win.CreateSolidBrush(commonPixelToWinPixel(options.background));
 
+        // Class cursor is null — we handle WM_SETCURSOR ourselves
+        // so setCursor/hideCursor work reliably.
         const window_class: win.WindowClass = .{
             .style = 0,
             .window_procedure = windowProc,
             .instance = wm.instance,
             .class_name = class_name,
-            .cursor = cursor,
+            .cursor = null,
             .background = background,
         };
 
@@ -267,6 +272,59 @@ pub const Window = struct {
         self.backbuffer = bitmap;
     }
 
+    pub fn hideCursor(self: *@This()) void {
+        self.cursor_visible = false;
+        cursor_hidden = true;
+        saved_cursor = active_cursor;
+        active_cursor = null;
+        _ = win.SetCursor(null);
+    }
+
+    pub fn showCursor(self: *@This()) void {
+        self.cursor_visible = true;
+        cursor_hidden = false;
+        active_cursor = saved_cursor;
+        if (active_cursor) |c| _ = win.SetCursor(c);
+    }
+
+    pub fn setCursor(self: *@This(), cursor: common.Cursor) void {
+        const cursor_name: win.CursorName = switch (cursor) {
+            .default => .Arrow,
+            .hand => .Hand,
+            .crosshair => .Cross,
+            .text => .Beam,
+            .not_allowed => .No,
+            .resize_ns => .SizeNS,
+            .resize_ew => .SizeWE,
+            .move => .SizeAll,
+        };
+        self.current_cursor = win.LoadCursorW(null, cursor_name);
+        active_cursor = self.current_cursor;
+        if (self.cursor_visible) {
+            _ = win.SetCursor(self.current_cursor);
+        }
+    }
+
+    pub fn grabCursor(self: *@This()) void {
+        var rect = win.Rect{};
+        _ = win.GetClientRect(self.handle, &rect);
+        var top_left = win.Point{ .x = rect.left, .y = rect.top };
+        var bottom_right = win.Point{ .x = rect.right, .y = rect.bottom };
+        _ = win.ClientToScreen(self.handle, &top_left);
+        _ = win.ClientToScreen(self.handle, &bottom_right);
+        var screen_rect = win.Rect{
+            .left = top_left.x,
+            .top = top_left.y,
+            .right = bottom_right.x,
+            .bottom = bottom_right.y,
+        };
+        _ = win.ClipCursor(&screen_rect);
+    }
+
+    pub fn releaseCursor(_: *@This()) void {
+        _ = win.ClipCursor(null);
+    }
+
     pub fn endDraw(self: *@This()) !void {
         if (self.backbuffer) |bb| {
             var rect = win.Rect{};
@@ -357,6 +415,10 @@ pub const Image = struct {
 
 var class_count = std.atomic.Value(usize).init(0);
 var events: queue.ThreadSafeQueue(common.Event) = .{};
+var active_cursor: ?win.CursorHandler = null;
+var saved_cursor: ?win.CursorHandler = null;
+var cursor_hidden: bool = false;
+var cursor_initialized: bool = false;
 
 /// Each window get it's own thread.
 /// WindowCreation and Message receiving must run on own thread.
@@ -593,6 +655,52 @@ pub fn windowProc(
         },
         .WM_DPICHANGED => {
             return win.DefWindowProcW(window_handle, message_type, wparam, lparam);
+        },
+        .WM_SETCURSOR => {
+            if ((lparam & 0xFFFF) == win.HTCLIENT) {
+                // Lazy-init default cursor on first WM_SETCURSOR
+                if (!cursor_initialized) {
+                    active_cursor = win.LoadCursorW(null, .Arrow);
+                    saved_cursor = active_cursor;
+                    cursor_initialized = true;
+                }
+                if (cursor_hidden) {
+                    _ = win.SetCursor(null);
+                    return 1;
+                }
+                if (active_cursor) |c| {
+                    _ = win.SetCursor(c);
+                    return 1;
+                }
+            }
+            return win.DefWindowProcW(window_handle, message_type, wparam, lparam);
+        },
+        .WM_MOUSEWHEEL => {
+            const delta_raw: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
+            const delta: f32 = @as(f32, @floatFromInt(delta_raw)) / @as(f32, @floatFromInt(win.WHEEL_DELTA));
+            // WM_MOUSEWHEEL gives screen coords — convert to client
+            var pt = win.Point{ .x = @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(lparam)))))), .y = @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(lparam)) >> 32)))) };
+            _ = win.ScreenToClient(window_handle, &pt);
+            events.push(.{ .mouse_scroll = .{
+                .x = @intCast(std.math.clamp(pt.x, std.math.minInt(i16), std.math.maxInt(i16))),
+                .y = @intCast(std.math.clamp(pt.y, std.math.minInt(i16), std.math.maxInt(i16))),
+                .scroll_x = 0,
+                .scroll_y = delta,
+                .window_id = window_id,
+            } });
+        },
+        .WM_MOUSEHWHEEL => {
+            const delta_raw: i16 = @bitCast(@as(u16, @truncate(wparam >> 16)));
+            const delta: f32 = @as(f32, @floatFromInt(delta_raw)) / @as(f32, @floatFromInt(win.WHEEL_DELTA));
+            var pt = win.Point{ .x = @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(lparam)))))), .y = @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(lparam)) >> 32)))) };
+            _ = win.ScreenToClient(window_handle, &pt);
+            events.push(.{ .mouse_scroll = .{
+                .x = @intCast(std.math.clamp(pt.x, std.math.minInt(i16), std.math.maxInt(i16))),
+                .y = @intCast(std.math.clamp(pt.y, std.math.minInt(i16), std.math.maxInt(i16))),
+                .scroll_x = delta,
+                .scroll_y = 0,
+                .window_id = window_id,
+            } });
         },
         .WM_SIZE => {
             const width = win.loword(lparam);

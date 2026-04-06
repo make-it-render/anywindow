@@ -5,12 +5,12 @@
     .paths = .{ "src", "build.zig", "build.zig.zon" },
     .dependencies = .{
         .windowz = .{
-            .url = "git+https://github.com/make-it-render/windowz#95dd351875074788da8e439770288aadc0d7464d",
-            .hash = "windowz-0.0.0-s8UrxcVqAADi-M7FqmW7AQtTp9BAM9nhbzOuEIKAdEY_",
+            .url = "git+https://github.com/make-it-render/windowz#282f1a43d07e642282384b68ea0da9492a4a6a8e",
+            .hash = "windowz-0.0.0-s8UrxfBsAADJdVtLAmxI8lpd-pseiX55LQCXpa-MKcLs",
         },
         .z11 = .{
-            .url = "git+https://github.com/make-it-render/z11#c4da2abdc77c2abcf9ff6fa93543b7bea45edf2a",
-            .hash = "z11-0.0.0-yiytBNo3AQDIcnP_AOHZZgCjUnwwLfvXl-RHjhaoCp89",
+            .url = "git+https://github.com/make-it-render/z11#ceed338ad1f693d27b402875c3c8d23e956727b5",
+            .hash = "z11-0.0.0-yiytBHQ-AQBrpjbtIxElGXZY9mi8kMGRd-eomnry3NvO",
         },
     },
 }

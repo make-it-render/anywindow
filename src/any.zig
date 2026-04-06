@@ -1,4 +1,3 @@
-
 pub const WindowManager = switch (builtin.os.tag) {
     .linux => x11.WindowManager,
     .windows => win32.WindowManager,
@@ -22,7 +21,7 @@ test "init" {
         error.WouldBlock, error.ConnectionRefused, error.FileNotFound => return,
         else => return err,
     };
-        defer wm.deinit();
+    defer wm.deinit();
 }
 
 pub const x11 = @import("x11.zig");
