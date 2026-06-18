@@ -2,18 +2,23 @@
 /// Uses Mutex + Condition for blocking receive.
 pub fn ThreadSafeQueue(Type: type) type {
     return struct {
+        io: std.Io,
         data: [256]?Type = [_]?Type{null} ** 256,
         head: u8 = 0,
         tail: u8 = 0,
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
         closed: bool = false,
 
         const Self = @This();
 
+        pub fn init(io: std.Io) Self {
+            return .{ .io = io };
+        }
+
         pub fn push(self: *Self, item: Type) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             if (self.tail +% 1 == self.head) {
                 log.warn("Event queue full, dropping oldest event", .{});
@@ -21,13 +26,13 @@ pub fn ThreadSafeQueue(Type: type) type {
             self.data[self.tail] = item;
             self.tail = self.tail +% 1;
 
-            self.cond.signal();
+            self.cond.signal(self.io);
         }
 
         /// Non-blocking pull. Returns null if empty.
         pub fn pull(self: *Self) ?Type {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             return self.pullUnlocked();
         }
@@ -35,25 +40,25 @@ pub fn ThreadSafeQueue(Type: type) type {
         /// Blocking receive. Waits until an item is available or the queue is closed.
         /// Returns null when closed and empty (shutdown signal).
         pub fn receive(self: *Self) ?Type {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             while (true) {
                 if (self.pullUnlocked()) |item| {
                     return item;
                 }
                 if (self.closed) return null;
-                self.cond.wait(&self.mutex);
+                self.cond.waitUncancelable(self.io, &self.mutex);
             }
         }
 
         /// Signal shutdown: wake all waiters so they can exit.
         pub fn close(self: *Self) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             self.closed = true;
-            self.cond.broadcast();
+            self.cond.broadcast(self.io);
         }
 
         fn pullUnlocked(self: *Self) ?Type {

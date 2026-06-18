@@ -1,9 +1,9 @@
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() != .leak);
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const environ = init.minimal.environ;
 
-    var wm = try win.WindowManager.init(allocator);
+    var wm = try win.WindowManager.init(io, environ, allocator);
     defer wm.deinit();
 
     var window = try wm.createWindow(
@@ -30,8 +30,6 @@ pub fn main() !void {
     defer window.destroyImage(&image);
     image.setPixels(&pixels);
 
-    var timer = try std.time.Timer.start();
-
     try window.redraw(.{});
     while (window.status == .open) {
         const event = try wm.receive() orelse break;
@@ -40,15 +38,11 @@ pub fn main() !void {
                 window.close();
             },
             .draw => {
-                timer.reset();
-
                 try window.beginDraw();
 
                 try image.draw(.{ .x = 100, .y = 100, .width = 50, .height = 50 });
 
                 try window.endDraw();
-
-                log.info("Time to draw: {d}ms", .{timer.lap() / std.time.ns_per_ms});
             },
             .key_pressed => |kp| {
                 switch (kp.key) {

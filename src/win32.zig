@@ -1,9 +1,11 @@
 pub const WindowManager = struct {
+    io: std.Io,
     allocator: std.mem.Allocator,
 
     instance: ?win.Instance,
 
-    pub fn init(allocator: std.mem.Allocator) !@This() {
+    pub fn init(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) !@This() {
+        _ = environ;
         const instance = win.GetModuleHandleW(null);
         if (instance == null) {
             const e = win.GetLastError();
@@ -11,8 +13,10 @@ pub const WindowManager = struct {
             return error.InitError;
         }
         _ = win.SetProcessDPIAware();
+        events = queue.ThreadSafeQueue(common.Event).init(io);
 
         return .{
+            .io = io,
             .allocator = allocator,
             .instance = instance,
         };
@@ -414,7 +418,7 @@ pub const Image = struct {
 };
 
 var class_count = std.atomic.Value(usize).init(0);
-var events: queue.ThreadSafeQueue(common.Event) = .{};
+var events: queue.ThreadSafeQueue(common.Event) = undefined;
 var active_cursor: ?win.CursorHandler = null;
 var saved_cursor: ?win.CursorHandler = null;
 var cursor_hidden: bool = false;
@@ -437,13 +441,13 @@ const WindowThread = struct {
     init_err: bool = false,
 
     // Sync
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     ready: bool = false,
 
     /// create window, check DPI and start loop to receive messages
     fn run(self: *@This()) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(self.wm.io);
 
         self.thread_id = win.GetCurrentThreadId();
 
@@ -464,8 +468,8 @@ const WindowThread = struct {
         if (handle == null) {
             self.init_err = true;
             self.ready = true;
-            self.cond.signal();
-            self.mutex.unlock();
+            self.cond.signal(self.wm.io);
+            self.mutex.unlock(self.wm.io);
             return;
         }
         self.handle = handle;
@@ -474,8 +478,8 @@ const WindowThread = struct {
         if (frame == null) {
             self.init_err = true;
             self.ready = true;
-            self.cond.signal();
-            self.mutex.unlock();
+            self.cond.signal(self.wm.io);
+            self.mutex.unlock(self.wm.io);
             return;
         }
         self.frame = frame;
@@ -484,8 +488,8 @@ const WindowThread = struct {
         self.scaling = @as(f32, @floatFromInt(dpi)) / 96.0;
 
         self.ready = true;
-        self.cond.signal();
-        self.mutex.unlock();
+        self.cond.signal(self.wm.io);
+        self.mutex.unlock(self.wm.io);
 
         // Message pump — blocks until WM_QUIT
         var msg: win.Message = undefined;
@@ -497,9 +501,9 @@ const WindowThread = struct {
 
     /// Wait for thread to finish window creation
     fn wait(self: *@This()) !void {
-        self.mutex.lock();
-        while (!self.ready) self.cond.wait(&self.mutex);
-        self.mutex.unlock();
+        self.mutex.lockUncancelable(self.wm.io);
+        while (!self.ready) self.cond.waitUncancelable(self.wm.io, &self.mutex);
+        self.mutex.unlock(self.wm.io);
 
         if (self.init_err) return error.CreateWindowError;
     }

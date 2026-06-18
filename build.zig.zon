@@ -2,15 +2,16 @@
     .name = .anywindow,
     .fingerprint = 0x2ba6fe46fef1f9fb,
     .version = "0.0.0",
+    .minimum_zig_version = "0.16.0",
     .paths = .{ "src", "build.zig", "build.zig.zon" },
     .dependencies = .{
         .windowz = .{
-            .url = "git+https://github.com/make-it-render/windowz#282f1a43d07e642282384b68ea0da9492a4a6a8e",
-            .hash = "windowz-0.0.0-s8UrxfBsAADJdVtLAmxI8lpd-pseiX55LQCXpa-MKcLs",
+            .url = "git+https://github.com/make-it-render/windowz#692d01c796cdfab044c77b815790368102e2c2e1",
+            .hash = "windowz-0.0.0-s8UrxQx6AACmld_zHl3a0O4UGBxXRVEudTkyaaNTdi-G",
         },
         .z11 = .{
-            .url = "git+https://github.com/make-it-render/z11#ceed338ad1f693d27b402875c3c8d23e956727b5",
-            .hash = "z11-0.0.0-yiytBHQ-AQBrpjbtIxElGXZY9mi8kMGRd-eomnry3NvO",
+            .url = "git+https://github.com/make-it-render/z11#f1acdd7fa95de8114bb66b392f5502aebb789181",
+            .hash = "z11-0.0.0-yiytBAFFAQBuwrLjrlY29Tp54GUyj5BJotu-Xj8AseGB",
         },
     },
 }

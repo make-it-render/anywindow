@@ -1,13 +1,15 @@
 pub const WindowManager = struct {
+    io: std.Io,
+    environ: std.process.Environ,
     allocator: std.mem.Allocator,
 
-    conn: std.net.Stream,
+    conn: std.Io.net.Stream,
     atoms: Atoms,
     info: x11.Setup,
     xid: x11.XID,
 
     net_writer_buffer: []u8,
-    net_writer: *std.net.Stream.Writer,
+    net_writer: *std.Io.net.Stream.Writer,
 
     events: queue.ThreadSafeQueue(common.Event),
     reader_thread: ?std.Thread = null,
@@ -24,49 +26,45 @@ pub const WindowManager = struct {
     min_keycode: u8,
     max_keycode: u8,
 
-    pub fn init(allocator: std.mem.Allocator) !@This() {
-        const conn = try x11.connect(.{});
+    pub fn init(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) !@This() {
+        const conn = try x11.connect(io, environ, .{});
 
-        const info = try x11.setup(allocator, conn);
+        const info = try x11.setup(io, environ, allocator, conn);
         errdefer info.deinit();
 
         var xid = x11.XID.init(info.resource_id_base, info.resource_id_mask);
 
         const atoms = Atoms{
-            .atom = try x11.internAtom(conn, "ATOM"),
-            .cardinal = try x11.internAtom(conn, "CARDINAL"),
-            .string = try x11.internAtom(conn, "STRING"),
-            .wm_name = try x11.internAtom(conn, "WM_NAME"),
-            .wm_protocols = try x11.internAtom(conn, "WM_PROTOCOLS"),
-            .wm_delete_window = try x11.internAtom(conn, "WM_DELETE_WINDOW"),
-            .net_wm_state = try x11.internAtom(conn, "_NET_WM_STATE"),
-            .net_wm_state_fullscreen = try x11.internAtom(conn, "_NET_WM_STATE_FULLSCREEN"),
-            .net_wm_icon = try x11.internAtom(conn, "_NET_WM_ICON"),
+            .atom = try x11.internAtom(io, conn, "ATOM"),
+            .cardinal = try x11.internAtom(io, conn, "CARDINAL"),
+            .string = try x11.internAtom(io, conn, "STRING"),
+            .wm_name = try x11.internAtom(io, conn, "WM_NAME"),
+            .wm_protocols = try x11.internAtom(io, conn, "WM_PROTOCOLS"),
+            .wm_delete_window = try x11.internAtom(io, conn, "WM_DELETE_WINDOW"),
+            .net_wm_state = try x11.internAtom(io, conn, "_NET_WM_STATE"),
+            .net_wm_state_fullscreen = try x11.internAtom(io, conn, "_NET_WM_STATE_FULLSCREEN"),
+            .net_wm_icon = try x11.internAtom(io, conn, "_NET_WM_ICON"),
         };
 
         const net_writer_buffer: []u8 = try allocator.alloc(u8, 4 * 1024);
         errdefer allocator.free(net_writer_buffer);
-        const net_writer = try allocator.create(std.net.Stream.Writer);
+        const net_writer = try allocator.create(std.Io.net.Stream.Writer);
         errdefer allocator.destroy(net_writer);
-        net_writer.* = conn.writer(net_writer_buffer);
+        net_writer.* = conn.writer(io, net_writer_buffer);
 
-        const scaling = getDesktopScaling(allocator) catch 1.0;
+        const scaling = getDesktopScaling(io, environ, allocator) catch 1.0;
 
         // Query keyboard mapping
         const min_kc = info.min_keycode;
         const max_kc = info.max_keycode;
         const kc_count = max_kc - min_kc + 1;
 
-        try x11.send(conn, x11.proto.GetKeyboardMapping{
+        try x11.send(io, conn, x11.proto.GetKeyboardMapping{
             .first_keycode = min_kc,
             .count = kc_count,
         });
 
-        var reply_buffer: [32]u8 = undefined;
-        var conn_reader = conn.reader(&reply_buffer);
-        var reader = conn_reader.interface();
-
-        const kb_reply = try x11.utils.readReply(reader, x11.proto.GetKeyboardMappingReply);
+        const kb_reply = try x11.receiveReply(io, conn, x11.proto.GetKeyboardMappingReply);
 
         var keysyms_per_keycode: u8 = 0;
         var keysym_map: []u32 = &[_]u32{};
@@ -78,13 +76,13 @@ pub const WindowManager = struct {
             errdefer allocator.free(keysym_map);
 
             const keysym_bytes = std.mem.sliceAsBytes(keysym_map);
-            try reader.readSliceAll(keysym_bytes);
+            try x11.receiveBytes(io, conn, keysym_bytes);
         }
 
         // Open the X11 "cursor" font for standard cursor shapes
         const cursor_font_id = try xid.genID();
         const cursor_font_name = "cursor";
-        try x11.sendWithBytes(conn, x11.proto.OpenFont{
+        try x11.sendWithBytes(io, conn, x11.proto.OpenFont{
             .length = undefined, // sendWithBytes recalculates this
             .font_id = cursor_font_id,
             .name_length = cursor_font_name.len,
@@ -92,7 +90,7 @@ pub const WindowManager = struct {
 
         // Create a 1x1 invisible cursor for hideCursor()
         const tmp_pixmap_id = try xid.genID();
-        try x11.send(conn, x11.proto.CreatePixmap{
+        try x11.send(io, conn, x11.proto.CreatePixmap{
             .pixmap_id = tmp_pixmap_id,
             .drawable_id = info.screens[0].root,
             .width = 1,
@@ -101,7 +99,7 @@ pub const WindowManager = struct {
         });
 
         const invisible_cursor_id = try xid.genID();
-        try x11.send(conn, x11.proto.CreateCursor{
+        try x11.send(io, conn, x11.proto.CreateCursor{
             .cursor_id = invisible_cursor_id,
             .source_pixmap = tmp_pixmap_id,
             .mask_pixmap = tmp_pixmap_id,
@@ -115,9 +113,11 @@ pub const WindowManager = struct {
             .y_hotspot = 0,
         });
 
-        try x11.send(conn, x11.proto.FreePixmap{ .pixmap_id = tmp_pixmap_id });
+        try x11.send(io, conn, x11.proto.FreePixmap{ .pixmap_id = tmp_pixmap_id });
 
         return .{
+            .io = io,
+            .environ = environ,
             .allocator = allocator,
             .conn = conn,
             .info = info,
@@ -137,7 +137,7 @@ pub const WindowManager = struct {
             .min_keycode = min_kc,
             .max_keycode = max_kc,
 
-            .events = .{},
+            .events = queue.ThreadSafeQueue(common.Event).init(io),
         };
     }
 
@@ -149,18 +149,18 @@ pub const WindowManager = struct {
         // Free cursor resources
         for (self.system_cursors) |cursor_id| {
             if (cursor_id != 0) {
-                x11.send(self.conn, x11.proto.FreeCursor{ .cursor_id = cursor_id }) catch {};
+                x11.send(self.io, self.conn, x11.proto.FreeCursor{ .cursor_id = cursor_id }) catch {};
             }
         }
         if (self.invisible_cursor_id != 0) {
-            x11.send(self.conn, x11.proto.FreeCursor{ .cursor_id = self.invisible_cursor_id }) catch {};
+            x11.send(self.io, self.conn, x11.proto.FreeCursor{ .cursor_id = self.invisible_cursor_id }) catch {};
         }
         if (self.cursor_font_id != 0) {
-            x11.send(self.conn, x11.proto.CloseFont{ .font_id = self.cursor_font_id }) catch {};
+            x11.send(self.io, self.conn, x11.proto.CloseFont{ .font_id = self.cursor_font_id }) catch {};
         }
 
         self.allocator.free(self.keysym_map);
-        self.conn.close();
+        self.conn.close(self.io);
         self.info.deinit();
         self.allocator.free(self.net_writer_buffer);
         self.allocator.destroy(self.net_writer);
@@ -195,7 +195,7 @@ pub const WindowManager = struct {
     }
 
     fn receive0(self: *@This()) !common.Event {
-        if (try x11.receive(self.conn)) |message| {
+        if (try x11.receive(self.io, self.conn, .none)) |message| {
             switch (message) {
                 .Expose => |expose| {
                     return .{
@@ -418,7 +418,7 @@ pub const Window = struct {
 
             .value_mask = x11.maskFromValues(x11.proto.WindowMask, window_values),
         };
-        try x11.sendWithValues(wm.conn, create_window, window_values);
+        try x11.sendWithValues(wm.io, wm.conn, create_window, window_values);
 
         const set_name_req = x11.proto.ChangeProperty{
             .window_id = window_id,
@@ -426,7 +426,7 @@ pub const Window = struct {
             .property_type = wm.atoms.string,
             .length_of_data = @intCast(options.title.len),
         };
-        try x11.sendWithBytes(wm.conn, set_name_req, options.title);
+        try x11.sendWithBytes(wm.io, wm.conn, set_name_req, options.title);
 
         const set_protocols = x11.proto.ChangeProperty{
             .window_id = window_id,
@@ -435,7 +435,7 @@ pub const Window = struct {
             .format = 32,
             .length_of_data = 1,
         };
-        try x11.sendWithBytes(wm.conn, set_protocols, &std.mem.toBytes(wm.atoms.wm_delete_window));
+        try x11.sendWithBytes(wm.io, wm.conn, set_protocols, &std.mem.toBytes(wm.atoms.wm_delete_window));
 
         const graphic_context_id = try wm.xid.genID();
         const graphic_context_values = x11.proto.GraphicContextValue{
@@ -448,7 +448,7 @@ pub const Window = struct {
             .drawable_id = window_id,
             .value_mask = x11.maskFromValues(x11.proto.GraphicContextMask, graphic_context_values),
         };
-        try x11.sendWithValues(wm.conn, create_gc, graphic_context_values);
+        try x11.sendWithValues(wm.io, wm.conn, create_gc, graphic_context_values);
 
         return .{
             .window_id = window_id,
@@ -464,13 +464,13 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        x11.send(self.wm.conn, x11.proto.DestroyWindow{ .window_id = self.window_id }) catch |err| {
+        x11.send(self.wm.io, self.wm.conn, x11.proto.DestroyWindow{ .window_id = self.window_id }) catch |err| {
             log.err("Error destroying window: {any}", .{err});
         };
     }
 
     pub fn close(self: *@This()) void {
-        x11.send(self.wm.conn, x11.proto.UnmapWindow{ .window_id = self.window_id }) catch |err| {
+        x11.send(self.wm.io, self.wm.conn, x11.proto.UnmapWindow{ .window_id = self.window_id }) catch |err| {
             log.err("Error unmapping window: {any}", .{err});
         };
         self.status = .closed;
@@ -478,7 +478,7 @@ pub const Window = struct {
 
     pub fn show(self: *@This()) !void {
         const map_req = x11.proto.MapWindow{ .window_id = self.window_id };
-        try x11.send(self.wm.conn, map_req);
+        try x11.send(self.wm.io, self.wm.conn, map_req);
     }
 
     pub fn toggleFullscreen(self: *@This()) void {
@@ -493,7 +493,7 @@ pub const Window = struct {
             .event_mask = x11.mask(&[_]x11.proto.EventMask{ .SubstructureNotify, .SubstructureRedirect }),
             .event = std.mem.toBytes(msg),
         };
-        x11.send(self.wm.conn, send_event) catch |err| {
+        x11.send(self.wm.io, self.wm.conn, send_event) catch |err| {
             log.err("Error sending fullscreen toggle: {any}", .{err});
         };
     }
@@ -525,13 +525,13 @@ pub const Window = struct {
             .format = 32,
             .length_of_data = @intCast(data_len),
         };
-        try x11.sendWithBytes(self.wm.conn, set_icon_req, std.mem.sliceAsBytes(data));
+        try x11.sendWithBytes(self.wm.io, self.wm.conn, set_icon_req, std.mem.sliceAsBytes(data));
     }
 
     pub fn hideCursor(self: *@This()) void {
         self.cursor_visible = false;
         const values = x11.proto.WindowValue{ .Cursor = self.wm.invisible_cursor_id };
-        x11.sendWithValues(self.wm.conn, x11.proto.ChangeWindowAttributes{
+        x11.sendWithValues(self.wm.io, self.wm.conn, x11.proto.ChangeWindowAttributes{
             .window_id = self.window_id,
             .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
         }, values) catch {};
@@ -541,7 +541,7 @@ pub const Window = struct {
         self.cursor_visible = true;
         const cursor_id = if (self.current_cursor != 0) self.current_cursor else @as(u32, 0);
         const values = x11.proto.WindowValue{ .Cursor = cursor_id };
-        x11.sendWithValues(self.wm.conn, x11.proto.ChangeWindowAttributes{
+        x11.sendWithValues(self.wm.io, self.wm.conn, x11.proto.ChangeWindowAttributes{
             .window_id = self.window_id,
             .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
         }, values) catch {};
@@ -552,7 +552,7 @@ pub const Window = struct {
         if (self.wm.system_cursors[index] == 0) {
             const glyph = cursorGlyph(cursor);
             const cursor_id = self.wm.xid.genID() catch return;
-            x11.send(self.wm.conn, x11.proto.CreateGlyphCursor{
+            x11.send(self.wm.io, self.wm.conn, x11.proto.CreateGlyphCursor{
                 .cursor_id = cursor_id,
                 .source_font = self.wm.cursor_font_id,
                 .mask_font = self.wm.cursor_font_id,
@@ -570,7 +570,7 @@ pub const Window = struct {
         self.current_cursor = self.wm.system_cursors[index];
         if (self.cursor_visible) {
             const values = x11.proto.WindowValue{ .Cursor = self.current_cursor };
-            x11.sendWithValues(self.wm.conn, x11.proto.ChangeWindowAttributes{
+            x11.sendWithValues(self.wm.io, self.wm.conn, x11.proto.ChangeWindowAttributes{
                 .window_id = self.window_id,
                 .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
             }, values) catch {};
@@ -578,7 +578,7 @@ pub const Window = struct {
     }
 
     pub fn grabCursor(self: *@This()) void {
-        x11.send(self.wm.conn, x11.proto.GrabPointer{
+        x11.send(self.wm.io, self.wm.conn, x11.proto.GrabPointer{
             .grab_window = self.window_id,
             .confine_to = self.window_id,
             .event_mask = @intCast(x11.mask(&[_]x11.proto.EventMask{ .ButtonPress, .ButtonRelease, .PointerMotion })),
@@ -586,7 +586,7 @@ pub const Window = struct {
     }
 
     pub fn releaseCursor(self: *@This()) void {
-        x11.send(self.wm.conn, x11.proto.UngrabPointer{}) catch {};
+        x11.send(self.wm.io, self.wm.conn, x11.proto.UngrabPointer{}) catch {};
     }
 
     pub fn createImage(self: *@This(), allocator: std.mem.Allocator, size: common.Size) !Image {
@@ -610,7 +610,7 @@ pub const Window = struct {
         };
 
         try x11.write(&self.wm.net_writer.interface, clear_area);
-        //try x11.send(self.wm.conn, clear_area);
+        //try x11.send(self.wm.io, self.wm.conn,clear_area);
     }
 
     pub fn redraw(self: *@This(), area: common.BBox) !void {
@@ -624,7 +624,7 @@ pub const Window = struct {
         };
         _ = clear_area;
         // sending fake redraw event;
-        //try x11.send(self.wm.conn, clear_area);
+        //try x11.send(self.wm.io, self.wm.conn,clear_area);
         //self.redrawn = true;
         self.wm.events.push(
             .{
@@ -682,7 +682,7 @@ pub const Image = struct {
             !std.meta.eql(self.pixmap_size, needed_size))
         {
             if (self.pixmap_id) |pid| {
-                x11.send(self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
+                x11.send(self.window.wm.io, self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
                     log.err("Failed to free image: {any}", .{err});
                 };
             }
@@ -761,7 +761,7 @@ pub const Image = struct {
 
     pub fn deinit(self: *@This()) void {
         if (self.pixmap_id) |pid| {
-            x11.send(self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
+            x11.send(self.window.wm.io, self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
                 log.err("Failed to free image: {any}", .{err});
             };
         }
@@ -952,25 +952,26 @@ fn commonPixelToX11Pixel(src: [3]u8) u32 {
     return std.mem.bytesToValue(u32, &dst);
 }
 
-fn getDesktopScaling(allocator: std.mem.Allocator) !f32 {
+fn getDesktopScaling(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) !f32 {
     var scaling: f32 = 1.0;
 
-    const conn = try x11.connect(.{});
-    defer conn.close();
+    const conn = try x11.connect(io, environ, .{});
+    defer conn.close(io);
 
-    const info = try x11.setup(allocator, conn);
+    const info = try x11.setup(io, environ, allocator, conn);
     defer info.deinit();
 
-    const string = try x11.internAtom(conn, "STRING");
+    const string = try x11.internAtom(io, conn, "STRING");
 
-    const resource_manager = try x11.internAtom(conn, "RESOURCE_MANAGER");
-    try x11.send(conn, x11.proto.GetProperty{
+    const resource_manager = try x11.internAtom(io, conn, "RESOURCE_MANAGER");
+    try x11.send(io, conn, x11.proto.GetProperty{
         .window_id = info.screens[0].root,
         .property = resource_manager,
         .property_type = string,
         .long_length = 1024,
     });
-    const resource_reply = try x11.receiveReply(conn, x11.proto.GetPropertyReply);
+
+    const resource_reply = try x11.receiveReply(io, conn, x11.proto.GetPropertyReply);
 
     if (resource_reply) |r| {
         if (r.value_len > 4096) {
@@ -979,9 +980,9 @@ fn getDesktopScaling(allocator: std.mem.Allocator) !f32 {
         }
         const tmp = try allocator.alloc(u8, r.value_len);
         defer allocator.free(tmp);
-        _ = try conn.read(tmp);
+        try x11.receiveBytes(io, conn, tmp);
 
-        var reader = std.Io.Reader.fixed(tmp);
+        var reader: std.Io.Reader = .fixed(tmp);
         while (try reader.takeDelimiter('\n')) |line| {
             if (std.mem.startsWith(u8, line, "Xft.dpi:")) {
                 var split = std.mem.splitScalar(u8, line, ':');

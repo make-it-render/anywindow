@@ -17,10 +17,8 @@ pub const Image = switch (builtin.os.tag) {
 };
 
 test "init" {
-    var wm = WindowManager.init(testing.allocator) catch |err| switch (err) {
-        error.WouldBlock, error.ConnectionRefused, error.FileNotFound => return,
-        else => return err,
-    };
+    const environ: std.process.Environ = .empty;
+    var wm = WindowManager.init(testing.io, environ, testing.allocator) catch return;
     defer wm.deinit();
 }
 
