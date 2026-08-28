@@ -58,7 +58,7 @@ pub const Event = union(enum) {
     },
     /// The compositor is about to repaint and the window may present a new
     /// frame — the answer to a `requestFrame`, delivered in step with the
-    /// display's refresh. Only backends that pace this way emit it (Wayland);
+    /// display's refresh. Only backends that pace this way emit it;
     /// `Window.supportsFramePacing` says which. The request is one-shot: to
     /// keep animating, call `requestFrame` again from here.
     frame_done: WindowID,

@@ -1033,13 +1033,11 @@ pub const Window = struct {
     }
 
     /// Ask the event loop to close this window from the application side — a
-    /// quit key, say. `close` alone would not do it: it destroys the window
-    /// but never delivers the `.close` event the loop stops on, and would not
-    /// wake a receive blocked on the socket. This injects a `.close` the same
-    /// way `redraw` injects a `.draw`: a sync callback whose `callback_done`
-    /// maps back to a close. The caller still handles that `.close` (which is
-    /// where the window is actually torn down), exactly as for a compositor
-    /// close.
+    /// quit key, say. `close` alone will not do it: it destroys the window but
+    /// delivers no `.close` event, which is what the loop stops on, and does
+    /// not wake a receive blocked on the socket. The caller still handles the
+    /// injected `.close`, exactly as for a compositor-initiated close — that is
+    /// where the window is torn down.
     pub fn requestClose(self: *@This()) void {
         const wm = self.wm;
         const callback_id = wm.display.newId(.callback) catch return;

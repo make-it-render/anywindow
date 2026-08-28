@@ -260,8 +260,8 @@ pub const Window = struct {
         events.push(.{ .close = @intFromPtr(self.handle) });
     }
 
-    /// Frame pacing here would want `DwmFlush` or a vblank wait; not done, so
-    /// this backend stays tick-paced and never emits `frame_done`.
+    /// No vblank source is wired up here, so this backend is tick-paced and
+    /// never emits `frame_done`.
     pub fn supportsFramePacing(_: *const @This()) bool {
         return false;
     }

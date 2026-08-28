@@ -99,7 +99,9 @@ fn verifyFramePacing(io: std.Io, wm: *win.WindowManager, window: *win.Window) !v
     try window.clear(.{});
     try window.endDraw();
 
-    for (0..50) |_| {
+    const max_polls = 50;
+    const poll_interval_ms = 20;
+    for (0..max_polls) |_| {
         try window.redraw(.{});
         while (try wm.receiveIo(io)) |event| {
             switch (event) {
@@ -109,7 +111,7 @@ fn verifyFramePacing(io: std.Io, wm: *win.WindowManager, window: *win.Window) !v
                 else => {},
             }
         }
-        try io.sleep(std.Io.Duration.fromMilliseconds(20), .awake);
+        try io.sleep(std.Io.Duration.fromMilliseconds(poll_interval_ms), .awake);
     }
     return error.NoFrameCallback;
 }
