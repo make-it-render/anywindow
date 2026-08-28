@@ -252,6 +252,14 @@ pub const Window = struct {
         );
     }
 
+    /// Ask the event loop to close this window from the application side — a
+    /// quit key. The message pump turns a real `WM_CLOSE` into a `.close`; this
+    /// queues the same event directly, since the app is not going through the
+    /// window's message queue.
+    pub fn requestClose(self: *@This()) void {
+        events.push(.{ .close = @intFromPtr(self.handle) });
+    }
+
     /// Frame pacing here would want `DwmFlush` or a vblank wait; not done, so
     /// this backend stays tick-paced and never emits `frame_done`.
     pub fn supportsFramePacing(_: *const @This()) bool {

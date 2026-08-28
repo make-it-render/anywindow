@@ -139,6 +139,12 @@ pub const Window = union(enum) {
         }
     }
 
+    pub fn requestClose(self: *@This()) void {
+        switch (self.*) {
+            inline else => |*window| return window.requestClose(),
+        }
+    }
+
     pub fn requestFrame(self: *@This()) void {
         switch (self.*) {
             inline else => |*window| return window.requestFrame(),

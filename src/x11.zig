@@ -511,6 +511,27 @@ pub const Window = struct {
         self.status = .closed;
     }
 
+    /// Ask the event loop to close this window from the application side — a
+    /// quit key. `close` only unmaps; it delivers no `.close` event for the
+    /// loop to stop on. Send ourselves the WM_DELETE_WINDOW ClientMessage the
+    /// window manager would send on a real close, which `receiveIo` already
+    /// turns into `.close`, and which reaching the server wakes a blocked read.
+    pub fn requestClose(self: *@This()) void {
+        const msg = x11.proto.ClientMessageEvent{
+            .window_id = self.window_id,
+            .message_type = self.wm.atoms.wm_protocols,
+            .data = .{ self.wm.atoms.wm_delete_window, 0, 0, 0, 0 },
+        };
+        const send_event = x11.proto.SendEvent{
+            .destination = self.window_id,
+            .event_mask = 0,
+            .event = std.mem.toBytes(msg),
+        };
+        x11.send(self.wm.io, self.wm.conn, send_event) catch |err| {
+            log.err("Error requesting close: {any}", .{err});
+        };
+    }
+
     pub fn show(self: *@This()) !void {
         const map_req = x11.proto.MapWindow{ .window_id = self.window_id };
         try x11.send(self.wm.io, self.wm.conn, map_req);

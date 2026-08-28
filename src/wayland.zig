@@ -70,6 +70,9 @@ pub const WindowManager = struct {
     /// wl_surface.frame callback id -> the window that asked, so its
     /// `callback_done` becomes a `frame_done` rather than a `draw`.
     frame_callbacks: std.AutoHashMapUnmanaged(u32, common.WindowID) = .empty,
+    /// Sync-callback id -> the window whose `requestClose` asked to quit, so
+    /// `callback_done` returns `.close` and the event loop stops.
+    close_callbacks: std.AutoHashMapUnmanaged(u32, common.WindowID) = .empty,
     /// Bound wl_output id -> integer scale. Only outputs present at init are
     /// tracked (hotplugged ones fall back to the per-surface scale signals).
     outputs: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -159,6 +162,7 @@ pub const WindowManager = struct {
         self.window_objects.deinit(self.allocator);
         self.redraw_callbacks.deinit(self.allocator);
         self.frame_callbacks.deinit(self.allocator);
+        self.close_callbacks.deinit(self.allocator);
         self.outputs.deinit(self.allocator);
         self.pending_resizes.deinit(self.allocator);
         if (self.keymap) |*keymap| keymap.deinit();
@@ -347,6 +351,9 @@ pub const WindowManager = struct {
                 }
                 if (self.frame_callbacks.fetchRemove(done.callback_id)) |entry| {
                     return .{ .frame_done = entry.value };
+                }
+                if (self.close_callbacks.fetchRemove(done.callback_id)) |entry| {
+                    return .{ .close = entry.value };
                 }
                 return null;
             },
@@ -1023,6 +1030,30 @@ pub const Window = struct {
             try proto.wayland.display.sync(writer, callback_id);
         }
         try wm.display.flush();
+    }
+
+    /// Ask the event loop to close this window from the application side — a
+    /// quit key, say. `close` alone would not do it: it destroys the window
+    /// but never delivers the `.close` event the loop stops on, and would not
+    /// wake a receive blocked on the socket. This injects a `.close` the same
+    /// way `redraw` injects a `.draw`: a sync callback whose `callback_done`
+    /// maps back to a close. The caller still handles that `.close` (which is
+    /// where the window is actually torn down), exactly as for a compositor
+    /// close.
+    pub fn requestClose(self: *@This()) void {
+        const wm = self.wm;
+        const callback_id = wm.display.newId(.callback) catch return;
+        {
+            wm.state_mutex.lockUncancelable(wm.io);
+            defer wm.state_mutex.unlock(wm.io);
+            wm.close_callbacks.put(wm.allocator, callback_id, self.window_id) catch return;
+        }
+        {
+            const writer = wm.display.acquire();
+            defer wm.display.release();
+            proto.wayland.display.sync(writer, callback_id) catch {};
+        }
+        wm.display.flush() catch {};
     }
 
     pub fn beginDraw(_: *@This()) !void {}
