@@ -1,6 +1,10 @@
 pub const x11 = @import("x11.zig");
 pub const win32 = @import("win32.zig");
 pub const common = @import("common.zig");
+pub const wayland = switch (builtin.os.tag) {
+    .linux => @import("wayland.zig"),
+    else => struct {},
+};
 pub const queue = @import("queue.zig");
 pub const keys = @import("keys.zig");
 pub const any = @import("any.zig");
@@ -25,6 +29,7 @@ pub const Event = common.Event;
 pub const WindowManager = any.WindowManager;
 pub const Image = any.Image;
 pub const Window = any.Window;
+pub const WindowSource = any.WindowSource;
 
 const std = @import("std");
 const testing = std.testing;
@@ -38,4 +43,7 @@ test {
     _ = win32;
     _ = keys;
     _ = any;
+    if (builtin.os.tag == .linux) {
+        _ = wayland;
+    }
 }

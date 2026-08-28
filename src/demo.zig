@@ -31,11 +31,13 @@ pub fn main(init: std.process.Init) !void {
     image.setPixels(&pixels);
 
     try window.redraw(.{});
-    while (window.status == .open) {
-        const event = try wm.receive() orelse break;
+    var running = true;
+    while (running) {
+        const event = try wm.receiveIo(io) orelse break;
         switch (event) {
             .close => {
                 window.close();
+                running = false;
             },
             .draw => {
                 try window.beginDraw();

@@ -11,9 +11,18 @@ pub const WindowManager = struct {
     net_writer_buffer: []u8,
     net_writer: *std.Io.net.Stream.Writer,
 
-    events: queue.ThreadSafeQueue(common.Event),
-    reader_thread: ?std.Thread = null,
-    shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// MIT-SHM, when the server offers it and is new enough to take a file descriptor.
+    /// Null means every present goes through core PutImage — SHM is an acceleration, never a
+    /// requirement, so nothing below may treat its absence as an error.
+    shm: ?x11.Extension,
+    /// Segments the server may still be reading, keyed by shmseg.
+    ///
+    /// Written from two tasks: the renderer adds a segment when it sends a ShmPutImage, and
+    /// whichever task reads the connection removes it when the matching ShmCompletion arrives
+    /// (see mapMessage). Keyed by XID rather than by pointer on purpose — a stale entry then only
+    /// costs that image the fast path, where a stale pointer would be a use-after-free.
+    in_flight: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    in_flight_mutex: std.Io.Mutex = .init,
 
     scaling: f32,
 
@@ -45,6 +54,10 @@ pub const WindowManager = struct {
             .net_wm_state_fullscreen = try x11.internAtom(io, conn, "_NET_WM_STATE_FULLSCREEN"),
             .net_wm_icon = try x11.internAtom(io, conn, "_NET_WM_ICON"),
         };
+
+        // Negotiate MIT-SHM while replies are still safe to read naively — once the event loop
+        // starts, its reader task owns the connection and would swallow any reply we waited for.
+        const shm_extension = probeShm(io, conn, info);
 
         const net_writer_buffer: []u8 = try allocator.alloc(u8, 4 * 1024);
         errdefer allocator.free(net_writer_buffer);
@@ -127,6 +140,8 @@ pub const WindowManager = struct {
             .net_writer_buffer = net_writer_buffer,
             .net_writer = net_writer,
 
+            .shm = shm_extension,
+
             .scaling = scaling,
 
             .cursor_font_id = cursor_font_id,
@@ -136,16 +151,10 @@ pub const WindowManager = struct {
             .keysyms_per_keycode = keysyms_per_keycode,
             .min_keycode = min_kc,
             .max_keycode = max_kc,
-
-            .events = queue.ThreadSafeQueue(common.Event).init(io),
         };
     }
 
     pub fn deinit(self: *@This()) void {
-        self.shutdown.store(true, .release);
-        self.events.close();
-        if (self.reader_thread) |t| t.join();
-
         // Free cursor resources
         for (self.system_cursors) |cursor_id| {
             if (cursor_id != 0) {
@@ -160,42 +169,59 @@ pub const WindowManager = struct {
         }
 
         self.allocator.free(self.keysym_map);
+        self.in_flight.deinit(self.allocator);
         self.conn.close(self.io);
         self.info.deinit();
         self.allocator.free(self.net_writer_buffer);
         self.allocator.destroy(self.net_writer);
     }
 
+    /// Record that a ShmPutImage naming `shmseg` is on its way to the server, so nothing
+    /// overwrites that segment before the server is done reading it.
+    /// Returns false if the segment could not be tracked, in which case the caller must not use
+    /// the SHM path — an untracked segment is one we could never prove safe to reuse.
+    fn markSegmentInFlight(self: *@This(), shmseg: u32) bool {
+        self.in_flight_mutex.lockUncancelable(self.io);
+        defer self.in_flight_mutex.unlock(self.io);
+        self.in_flight.put(self.allocator, shmseg, {}) catch return false;
+        return true;
+    }
+
+    /// Whether the server may still be reading `shmseg`.
+    fn isSegmentInFlight(self: *@This(), shmseg: u32) bool {
+        self.in_flight_mutex.lockUncancelable(self.io);
+        defer self.in_flight_mutex.unlock(self.io);
+        return self.in_flight.contains(shmseg);
+    }
+
+    /// The server has finished with `shmseg`; it is safe to overwrite again.
+    fn clearSegmentInFlight(self: *@This(), shmseg: u32) void {
+        self.in_flight_mutex.lockUncancelable(self.io);
+        defer self.in_flight_mutex.unlock(self.io);
+        _ = self.in_flight.remove(shmseg);
+    }
+
     pub fn createWindow(self: *@This(), options: common.WindowOptions) !Window {
         return try Window.init(self, options);
     }
 
-    pub fn receive(self: *@This()) !?common.Event {
-        if (self.reader_thread == null) {
-            self.reader_thread = std.Thread.spawn(.{}, readerRun, .{self}) catch return error.ThreadSpawnError;
-        }
-        return self.events.receive();
-    }
-
-    /// Unblock any thread waiting in receive() so it returns null.
-    pub fn stop(self: *@This()) void {
-        self.shutdown.store(true, .release);
-        self.events.close();
-    }
-
-    fn readerRun(self: *@This()) void {
-        defer self.events.close();
-        while (!self.shutdown.load(.acquire)) {
-            const event = self.receive0() catch break;
-            switch (event) {
-                .nop => continue,
-                else => self.events.push(event),
+    /// Event source for recvloop's io loop: reads events directly through `io`.
+    /// The socket read is a cancelation point, so a task blocked here is
+    /// interrupted by `io` cancelation (e.g. the loop's group cancel in `deinit`)
+    /// and returns `error.Canceled`. Internal no-op messages are skipped.
+    pub fn receiveIo(self: *@This(), io: std.Io) !?common.Event {
+        while (true) {
+            const message = try x11.receive(io, self.conn, .none) orelse continue;
+            switch (self.mapMessage(message)) {
+                .nop => {}, // ignored message — keep reading
+                else => |event| return event,
             }
         }
     }
 
-    fn receive0(self: *@This()) !common.Event {
-        if (try x11.receive(self.io, self.conn, .none)) |message| {
+    /// Map a raw X11 message to a `common.Event` (`.nop` for messages we ignore).
+    fn mapMessage(self: *@This(), message: x11.Message) common.Event {
+        {
             switch (message) {
                 .Expose => |expose| {
                     return .{
@@ -326,12 +352,21 @@ pub const WindowManager = struct {
                         },
                     };
                 },
+                .Generic => |generic| {
+                    // Extension events have server-assigned codes, so they can only be identified
+                    // by comparing against the bases we got at negotiation time.
+                    if (self.shm) |ext| {
+                        if (ext.isEvent(generic.code, x11.shm.Event.completion)) {
+                            const completion = generic.as(x11.shm.Completion);
+                            self.clearSegmentInFlight(completion.shmseg);
+                        }
+                    }
+                    return .{ .nop = {} };
+                },
                 else => {
                     return .{ .nop = {} };
                 },
             }
-        } else {
-            return .{ .nop = {} };
         }
     }
 
@@ -613,6 +648,9 @@ pub const Window = struct {
         //try x11.send(self.wm.io, self.wm.conn,clear_area);
     }
 
+    /// Inject a synthetic `.draw` event through the server: ClearArea with
+    /// exposures makes it send an Expose, which wakes the blocked receive
+    /// and maps to `.draw`.
     pub fn redraw(self: *@This(), area: common.BBox) !void {
         const clear_area = x11.proto.ClearArea{
             .window_id = self.window_id,
@@ -622,17 +660,7 @@ pub const Window = struct {
             .width = area.width,
             .exposures = true,
         };
-        _ = clear_area;
-        // sending fake redraw event;
-        //try x11.send(self.wm.io, self.wm.conn,clear_area);
-        //self.redrawn = true;
-        self.wm.events.push(
-            .{
-                .draw = .{
-                    .window_id = self.window_id,
-                },
-            },
-        );
+        try x11.send(self.wm.io, self.wm.conn, clear_area);
     }
 
     pub fn beginDraw(_: *@This()) !void {}
@@ -640,6 +668,15 @@ pub const Window = struct {
     pub fn endDraw(self: *@This()) !void {
         try self.wm.flush();
     }
+
+    /// z11 has no Present extension, so there is no vblank to pace on: this
+    /// backend stays tick-paced and never emits `frame_done`.
+    pub fn supportsFramePacing(_: *const @This()) bool {
+        return false;
+    }
+
+    /// No compositor frame callback on X11; nothing to arm.
+    pub fn requestFrame(_: *@This()) void {}
 };
 
 pub const Image = struct {
@@ -649,6 +686,11 @@ pub const Image = struct {
     pixels: []u8,
     pixmap_id: ?u32 = null,
     pixmap_size: common.Size = .{ .width = 0, .height = 0 },
+    /// Shared buffer backing the SHM present path. Created on the first draw (the first point the
+    /// scaled size is known) and recreated when that size changes. Null whenever the core PutImage
+    /// path is in use, whether because the server has no MIT-SHM or because setup failed.
+    segment: ?x11.shm.Segment = null,
+    segment_size: common.Size = .{ .width = 0, .height = 0 },
 
     pub fn init(allocator: std.mem.Allocator, window: *Window, size: common.Size) !@This() {
         const len = @as(usize, size.width) * size.height * 4;
@@ -678,6 +720,101 @@ pub const Image = struct {
         };
 
         const needed_size = common.Size{ .width = phys_width, .height = phys_height };
+
+        if (try self.drawShm(phys_target, needed_size)) return;
+        try self.drawCore(phys_target, needed_size);
+    }
+
+    /// Present through shared memory: scale and swizzle straight into the segment, then hand the
+    /// server a 40-byte request naming it. Nothing about the pixels crosses the socket.
+    ///
+    /// Returns false when this frame has to go the core route instead — no MIT-SHM, setup failed,
+    /// or the server has not finished reading the segment yet. All three are normal, so the caller
+    /// falls back rather than failing. Errors are reserved for a broken connection.
+    fn drawShm(self: *@This(), target: common.BBox, needed_size: common.Size) !bool {
+        const wm = self.window.wm;
+        const ext = wm.shm orelse return false;
+        if (needed_size.width == 0 or needed_size.height == 0) return false;
+
+        if (self.segment != null and !std.meta.eql(self.segment_size, needed_size)) {
+            self.releaseSegment();
+        }
+
+        if (self.segment == null) {
+            const size = @as(usize, needed_size.width) * needed_size.height * 4;
+            // The attach carries a descriptor, so it bypasses the buffered writer and goes
+            // straight out. Flush first, or it overtakes requests queued earlier this frame.
+            try wm.flush();
+            self.segment = x11.shm.Segment.init(wm.io, wm.conn, ext, &wm.xid, size) catch |err| {
+                log.warn("Failed to attach shm segment ({any}); using core PutImage", .{err});
+                return false;
+            };
+            self.segment_size = needed_size;
+        }
+        const segment = &self.segment.?;
+
+        // The server is still reading the last frame out of this buffer. Rather than stall the
+        // render loop or double the memory, let this one frame take the core path.
+        if (wm.isSegmentInFlight(segment.shmseg)) return false;
+
+        nearestNeighborInto(
+            segment.bytes,
+            self.pixels,
+            self.source_size.width,
+            self.source_size.height,
+            needed_size.width,
+            needed_size.height,
+        );
+        const image_info = x11.getImageInfo(wm.info, self.window.root);
+        try x11.rgbaToZPixmapInPlace(image_info, segment.bytes);
+
+        // Track before sending: a segment we cannot prove idle must never be reused.
+        if (!wm.markSegmentInFlight(segment.shmseg)) return false;
+        errdefer wm.clearSegmentInFlight(segment.shmseg);
+
+        // Buffered, so it stays ordered with ClearArea and the other drawing this frame.
+        // One request replaces the pixmap, the strip loop and the CopyArea the core path needs.
+        try x11.write(&wm.net_writer.interface, x11.shm.PutImage{
+            .major_opcode = ext.major_opcode,
+            .drawable_id = self.window.window_id,
+            .graphic_context_id = self.window.graphic_context_id,
+            .total_width = needed_size.width,
+            .total_height = needed_size.height,
+            .src_width = target.width,
+            .src_height = target.height,
+            .dst_x = target.x,
+            .dst_y = target.y,
+            .depth = self.window.depth,
+            .shmseg = segment.shmseg,
+            // Ask for the ShmCompletion that clears in_flight; without it we could never know
+            // when this buffer is safe to overwrite.
+            .send_event = 1,
+        });
+        return true;
+    }
+
+    /// Detach and unmap the segment. Safe to call whether or not the server is still reading it:
+    /// the flush puts Detach behind any ShmPutImage already queued, and the server handles
+    /// requests in order, so it is done with the buffer before it sees the Detach.
+    fn releaseSegment(self: *@This()) void {
+        if (self.segment == null) return;
+        const segment = &self.segment.?;
+        const wm = self.window.wm;
+
+        wm.flush() catch |err| log.err("Failed to flush before detaching shm segment: {any}", .{err});
+        if (wm.shm) |ext| segment.deinit(wm.io, wm.conn, ext);
+        wm.clearSegmentInFlight(segment.shmseg);
+
+        self.segment = null;
+        self.segment_size = .{ .width = 0, .height = 0 };
+    }
+
+    /// Present through the core protocol: every pixel goes over the socket into a pixmap, in
+    /// strips small enough for a request length, then a CopyArea onto the window.
+    fn drawCore(self: *@This(), phys_target: common.BBox, needed_size: common.Size) !void {
+        const phys_width = needed_size.width;
+        const phys_height = needed_size.height;
+
         if (self.pixmap_id == null or
             !std.meta.eql(self.pixmap_size, needed_size))
         {
@@ -760,6 +897,7 @@ pub const Image = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        self.releaseSegment();
         if (self.pixmap_id) |pid| {
             x11.send(self.window.wm.io, self.window.wm.conn, x11.proto.FreePixmap{ .pixmap_id = pid }) catch |err| {
                 log.err("Failed to free image: {any}", .{err});
@@ -768,6 +906,30 @@ pub const Image = struct {
         self.allocator.free(self.pixels);
     }
 };
+
+/// Decide once, at startup, whether frames can go through shared memory. Null means the core
+/// PutImage path handles everything — SHM is an acceleration, so every reason to decline it is
+/// normal rather than an error.
+fn probeShm(io: std.Io, conn: std.Io.net.Stream, info: x11.Setup) ?x11.Extension {
+    const extension = x11.shm.probe(io, conn) catch |err| {
+        log.warn("MIT-SHM probe failed ({any}); using core PutImage", .{err});
+        return null;
+    } orelse return null;
+
+    // SHM only changes how pixels travel, not their layout: the same RGBA->ZPixmap conversion still
+    // has to work for this visual. Settle that here rather than mid-frame, because unlike
+    // RgbaToZPixmapReader (which converts blindly) the in-place conversion the SHM path needs
+    // rejects formats it does not handle — and a present path must never fail where the core one
+    // would have drawn something.
+    const image_info = x11.getImageInfo(info, info.screens[0].root);
+    var probe_pixel = [_]u8{ 0, 0, 0, 0 };
+    x11.rgbaToZPixmapInPlace(image_info, &probe_pixel) catch |err| {
+        log.warn("MIT-SHM present unsupported for this visual ({any}); using core PutImage", .{err});
+        return null;
+    };
+
+    return extension;
+}
 
 fn scaleU16(v: u16, scaling: f32) u16 {
     if (scaling == 1.0) return v;
@@ -787,22 +949,41 @@ fn nearestNeighbor(
     dst_width: common.Width,
     dst_height: common.Height,
 ) ![]u8 {
+    const dst_pixels = try allocator.alloc(u8, @as(usize, dst_width) * dst_height * 4);
+    errdefer allocator.free(dst_pixels);
+    nearestNeighborInto(dst_pixels, src, src_width, src_height, dst_width, dst_height);
+    return dst_pixels;
+}
+
+/// Scale `src` into `dst_pixels`, which must hold exactly `dst_width * dst_height` RGBA pixels.
+/// Writing into a caller's buffer is what lets the SHM path scale directly into shared memory
+/// and skip the intermediate frame allocation entirely.
+fn nearestNeighborInto(
+    dst_pixels: []u8,
+    src: []const u8,
+    src_width: common.Width,
+    src_height: common.Height,
+    dst_width: common.Width,
+    dst_height: common.Height,
+) void {
     const src_w: usize = src_width;
     const src_h: usize = src_height;
     const dst_w: usize = dst_width;
     const dst_h: usize = dst_height;
 
+    std.debug.assert(dst_pixels.len == dst_w * dst_h * 4);
+
     const y_ratio: f64 = @as(f64, @floatFromInt(src_height)) / @as(f64, @floatFromInt(dst_height));
     const x_ratio: f64 = @as(f64, @floatFromInt(src_width)) / @as(f64, @floatFromInt(dst_width));
 
-    const dst_pixels = try allocator.alloc(u8, dst_w * dst_h * 4);
-
-    // Precompute source X index for each destination column
-    const col_map = try allocator.alloc(usize, dst_w);
-    defer allocator.free(col_map);
-    for (0..dst_w) |dst_x| {
-        col_map[dst_x] = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_x)) * x_ratio)), src_w -| 1);
-    }
+    // Source column for a destination column. Computed on demand rather than precomputed into a
+    // table, so this needs no allocation and can write straight into a shared-memory segment.
+    const mapSrcX = struct {
+        fn f(dst_x: usize, ratio: f64, limit: usize) usize {
+            return @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_x)) * ratio)), limit);
+        }
+    }.f;
+    const max_src_x = src_w -| 1;
 
     for (0..dst_h) |dst_y| {
         const mapped_src_y = @min(@as(usize, @intFromFloat(@as(f32, @floatFromInt(dst_y)) * y_ratio)), src_h -| 1);
@@ -811,12 +992,12 @@ fn nearestNeighbor(
 
         var dst_x: usize = 0;
         while (dst_x < dst_w) {
-            const mapped_src_x = col_map[dst_x];
+            const mapped_src_x = mapSrcX(dst_x, x_ratio, max_src_x);
             const src_pixel = src[src_row_start + mapped_src_x * 4 ..][0..4];
 
             // Find run of consecutive dst pixels mapping to the same src pixel
             var run_end = dst_x + 1;
-            while (run_end < dst_w and col_map[run_end] == mapped_src_x) : (run_end += 1) {}
+            while (run_end < dst_w and mapSrcX(run_end, x_ratio, max_src_x) == mapped_src_x) : (run_end += 1) {}
 
             // Fill run with same pixel (LLVM auto-vectorizes to wide stores)
             for (dst_x..run_end) |col| {
@@ -826,8 +1007,6 @@ fn nearestNeighbor(
             dst_x = run_end;
         }
     }
-
-    return dst_pixels;
 }
 
 test "nearestNeighbor 2x upscale" {
@@ -1025,7 +1204,6 @@ const std = @import("std");
 const testing = std.testing;
 const x11 = @import("x11");
 const common = @import("common.zig");
-const queue = @import("queue.zig");
 const keys = @import("keys.zig");
 
 const log = std.log.scoped(.any_x11);

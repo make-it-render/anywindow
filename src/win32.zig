@@ -30,13 +30,12 @@ pub const WindowManager = struct {
         return try Window.init(self, options);
     }
 
-    pub fn receive(_: *@This()) !?common.Event {
-        return events.receive();
-    }
-
-    /// Unblock any thread waiting in receive() so it returns null.
-    pub fn stop(_: *@This()) void {
-        events.close();
+    /// io-native event source: blocks on the event queue with an io-cancelable
+    /// wait, so a task blocked here is interrupted by `io` cancelation. The
+    /// WndProc still feeds the queue. Counterpart to the X11 backend's
+    /// direct-read `receiveIo`; both back `any.WindowSource`.
+    pub fn receiveIo(_: *@This(), io: std.Io) !?common.Event {
+        return events.receiveCancelable(io);
     }
 
     pub fn flush(_: *@This()) !void {
@@ -252,6 +251,15 @@ pub const Window = struct {
             },
         );
     }
+
+    /// Frame pacing here would want `DwmFlush` or a vblank wait; not done, so
+    /// this backend stays tick-paced and never emits `frame_done`.
+    pub fn supportsFramePacing(_: *const @This()) bool {
+        return false;
+    }
+
+    /// No frame callback wired up on Windows; nothing to arm.
+    pub fn requestFrame(_: *@This()) void {}
 
     pub fn beginDraw(self: *@This()) !void {
         const window_dc = win.GetDC(self.handle);

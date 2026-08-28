@@ -16,6 +16,12 @@ pub fn build(b: *std.Build) void {
     });
     const windows = windows_dep.module("windows");
 
+    const wayland_dep = b.dependency("mir_wayland", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const wayland = wayland_dep.module("wayland");
+
     const any = b.addModule(
         "anywindow",
         .{
@@ -27,6 +33,7 @@ pub fn build(b: *std.Build) void {
     );
     any.addImport("x11", x11);
     any.addImport("windows", windows);
+    any.addImport("wayland", wayland);
 
     {
         const demo_mod = b.addModule("demo", .{
@@ -49,6 +56,23 @@ pub fn build(b: *std.Build) void {
     }
 
     {
+        const verify_mod = b.addModule("verify", .{
+            .root_source_file = b.path("src/verify.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        verify_mod.addImport("anywindow", any);
+        const verify = b.addExecutable(.{
+            .name = "verify",
+            .root_module = verify_mod,
+        });
+
+        const run_verify = b.addRunArtifact(verify);
+        const verify_step = b.step("verify", "Verify backend features against the live display server");
+        verify_step.dependOn(&run_verify.step);
+    }
+
+    {
         const tests_mod = b.addModule("tests", .{
             .target = target,
             .optimize = optimize,
@@ -59,6 +83,7 @@ pub fn build(b: *std.Build) void {
         });
         tests.root_module.addImport("x11", x11);
         tests.root_module.addImport("windows", windows);
+        tests.root_module.addImport("wayland", wayland);
 
         const run_tests = b.addRunArtifact(tests);
         const run_tests_step = b.step("test", "Run tests");
@@ -77,6 +102,7 @@ pub fn build(b: *std.Build) void {
         });
         docs.root_module.addImport("x11", x11);
         docs.root_module.addImport("windows", windows);
+        docs.root_module.addImport("wayland", wayland);
 
         const install_docs = b.addInstallDirectory(.{
             .source_dir = docs.getEmittedDocs(),

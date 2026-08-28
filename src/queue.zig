@@ -52,6 +52,25 @@ pub fn ThreadSafeQueue(Type: type) type {
             }
         }
 
+        /// io-cancelable blocking receive. Like `receive`, but the wait is a
+        /// cancelation point: returns `error.Canceled` if the calling task is
+        /// canceled, and null when closed and empty. Used by the io-native
+        /// source path (`WindowManager.receiveIo`).
+        pub fn receiveCancelable(self: *Self, io: std.Io) std.Io.Cancelable!?Type {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            while (true) {
+                if (self.pullUnlocked()) |item| {
+                    return item;
+                }
+                if (self.closed) return null;
+                // `cond.wait` re-acquires the mutex before returning, even on
+                // `error.Canceled`, so the `defer unlock` above stays correct.
+                try self.cond.wait(io, &self.mutex);
+            }
+        }
+
         /// Signal shutdown: wake all waiters so they can exit.
         pub fn close(self: *Self) void {
             self.mutex.lockUncancelable(self.io);

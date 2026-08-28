@@ -13,5 +13,10 @@
             .url = "git+https://github.com/make-it-render/z11#f1acdd7fa95de8114bb66b392f5502aebb789181",
             .hash = "z11-0.0.0-yiytBAFFAQBuwrLjrlY29Tp54GUyj5BJotu-Xj8AseGB",
         },
+        // Local path until mir-wayland gets its first push to
+        // github.com/make-it-render — switch to url+hash then.
+        .mir_wayland = .{
+            .path = "../mir-wayland",
+        },
     },
 }
