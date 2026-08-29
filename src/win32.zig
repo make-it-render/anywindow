@@ -266,6 +266,13 @@ pub const Window = struct {
         return false;
     }
 
+    /// The window's current DPI scale, following the monitor it is on.
+    pub fn scale(self: *@This()) f32 {
+        const dpi = win.GetDpiForWindow(self.handle);
+        if (dpi == 0) return self.scaling;
+        return @as(f32, @floatFromInt(dpi)) / 96.0;
+    }
+
     /// No frame callback wired up on Windows; nothing to arm.
     pub fn requestFrame(_: *@This()) void {}
 
@@ -317,6 +324,9 @@ pub const Window = struct {
             .resize_ns => .SizeNS,
             .resize_ew => .SizeWE,
             .move => .SizeAll,
+            .wait => .Wait,
+            .resize_nwse => .SizeNWSE,
+            .resize_nesw => .SizeNESW,
         };
         self.current_cursor = win.LoadCursorW(null, cursor_name);
         active_cursor = self.current_cursor;
@@ -512,6 +522,24 @@ const WindowThread = struct {
         while (win.GetMessageW(&msg, null, 0, 0) > 0) {
             _ = win.TranslateMessage(&msg);
             _ = win.DispatchMessageW(&msg);
+            if (msg.message == .WM_KEYDOWN or msg.message == .WM_SYSKEYDOWN) {
+                takeCharacterMessages(msg.hwnd);
+                flushPendingKey();
+            }
+        }
+    }
+
+    /// TranslateMessage queues the character a key down produces (WM_CHAR,
+    /// WM_DEADCHAR or WM_UNICHAR) behind the key message. Dispatch it now,
+    /// so the key_pressed carries its codepoint instead of waiting for
+    /// whatever message comes next.
+    fn takeCharacterMessages(window_handle: ?win.WindowHandle) void {
+        var msg: win.Message = undefined;
+        while (PeekMessageW(&msg, window_handle, @intFromEnum(win.MessageType.WM_CHAR), @intFromEnum(win.MessageType.WM_DEADCHAR), pm_remove) != 0) {
+            _ = win.DispatchMessageW(&msg);
+        }
+        while (PeekMessageW(&msg, window_handle, wm_unichar_code, wm_unichar_code, pm_remove) != 0) {
+            _ = win.DispatchMessageW(&msg);
         }
     }
 
@@ -645,14 +673,33 @@ pub fn windowProc(
             const key = keys.windowsVkToKey(vk);
             const mods = getWindowsModifiers();
 
-            events.push(.{
-                .key_pressed = .{
-                    .scancode = sc,
-                    .key = key,
-                    .modifiers = mods,
-                    .window_id = window_id,
-                },
-            });
+            // Held until its WM_CHAR arrives (or does not); see the pump.
+            flushPendingKey();
+            pending_key = .{
+                .scancode = sc,
+                .key = key,
+                .modifiers = mods,
+                .repeat = flags.previousState == 1,
+                .window_id = window_id,
+            };
+        },
+        .WM_CHAR => {
+            pushCharacterUtf16(window_id, @truncate(wparam));
+        },
+        wm_unichar => {
+            // UNICODE_NOCHAR asks whether we take UTF-32 characters; yes.
+            if (wparam == 0xFFFF) return 1;
+            const codepoint = std.math.cast(u21, wparam) orelse return 0;
+            pushCharacter(window_id, codepoint);
+        },
+        wm_setfocus => {
+            events.push(.{ .focus_in = window_id });
+            return 0;
+        },
+        wm_killfocus => {
+            flushPendingKey();
+            events.push(.{ .focus_out = window_id });
+            return 0;
         },
         .WM_KEYUP => {
             const flags: win.KeystrokeFlags = @bitCast(lparam);
@@ -674,7 +721,25 @@ pub fn windowProc(
             return win.DefWindowProcW(window_handle, message_type, wparam, lparam);
         },
         .WM_DPICHANGED => {
-            return win.DefWindowProcW(window_handle, message_type, wparam, lparam);
+            // wParam carries the new DPI (x in the low word), lParam the
+            // rectangle Windows suggests so the window keeps its size on
+            // the new monitor; a resize follows through WM_SIZE.
+            const dpi: u32 = @intCast(wparam & 0xFFFF);
+            events.push(.{ .scale_changed = .{
+                .window_id = window_id,
+                .scale = @as(f32, @floatFromInt(dpi)) / 96.0,
+            } });
+            const suggested: *const win.Rect = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            _ = win.SetWindowPos(
+                window_handle,
+                null,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                win.SWP_NOZORDER,
+            );
+            return 0;
         },
         .WM_SETCURSOR => {
             if ((lparam & 0xFFFF) == win.HTCLIENT) {
@@ -738,6 +803,91 @@ pub fn windowProc(
         },
     }
     return 1;
+}
+
+// Message codes windowz does not name; MessageType is non-exhaustive.
+const wm_setfocus: win.MessageType = @enumFromInt(0x0007);
+const wm_killfocus: win.MessageType = @enumFromInt(0x0008);
+const wm_unichar_code: u32 = 0x0109;
+const wm_unichar: win.MessageType = @enumFromInt(wm_unichar_code);
+const pm_remove: u32 = 0x0001;
+
+extern "user32" fn PeekMessageW(
+    message: *win.Message,
+    window_handle: ?win.WindowHandle,
+    filter_min: u32,
+    filter_max: u32,
+    remove: u32,
+) callconv(.winapi) c_int;
+
+/// A key down waiting for the character message that follows it. Each window
+/// runs its own message thread, so this is per thread.
+const PendingKey = struct {
+    scancode: common.Scancode,
+    key: common.Key,
+    modifiers: common.Modifiers,
+    repeat: bool,
+    window_id: common.WindowID,
+};
+
+threadlocal var pending_key: ?PendingKey = null;
+threadlocal var pending_high_surrogate: ?u16 = null;
+
+/// Emit the waiting key down with no character.
+fn flushPendingKey() void {
+    const pending = pending_key orelse return;
+    pending_key = null;
+    events.push(.{ .key_pressed = .{
+        .scancode = pending.scancode,
+        .key = pending.key,
+        .modifiers = pending.modifiers,
+        .codepoint = null,
+        .repeat = pending.repeat,
+        .window_id = pending.window_id,
+    } });
+}
+
+/// One WM_CHAR code unit: surrogate pairs arrive as two messages.
+fn pushCharacterUtf16(window_id: common.WindowID, unit: u16) void {
+    if (unit >= 0xD800 and unit <= 0xDBFF) {
+        pending_high_surrogate = unit;
+        return;
+    }
+    var codepoint: u21 = unit;
+    if (unit >= 0xDC00 and unit <= 0xDFFF) {
+        const high = pending_high_surrogate orelse return;
+        pending_high_surrogate = null;
+        codepoint = 0x10000 + ((@as(u21, high) - 0xD800) << 10) + (unit - 0xDC00);
+    }
+    pushCharacter(window_id, codepoint);
+}
+
+/// Attach a character to the waiting key down, or — when it arrives on its
+/// own (an IME, Alt+numpad) — report it as a press of no particular key.
+/// Control characters (Enter, Backspace, Ctrl combinations) are not text.
+fn pushCharacter(window_id: common.WindowID, codepoint: u21) void {
+    const text: ?u21 = if (codepoint < 0x20 or codepoint == 0x7F) null else codepoint;
+    if (pending_key) |pending| {
+        pending_key = null;
+        events.push(.{ .key_pressed = .{
+            .scancode = pending.scancode,
+            .key = pending.key,
+            .modifiers = pending.modifiers,
+            .codepoint = text,
+            .repeat = pending.repeat,
+            .window_id = pending.window_id,
+        } });
+        return;
+    }
+    const character = text orelse return;
+    events.push(.{ .key_pressed = .{
+        .scancode = .unknown,
+        .key = .unknown,
+        .modifiers = getWindowsModifiers(),
+        .codepoint = character,
+        .repeat = false,
+        .window_id = window_id,
+    } });
 }
 
 /// RGB to ABGR

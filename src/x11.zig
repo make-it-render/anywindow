@@ -28,7 +28,11 @@ pub const WindowManager = struct {
 
     cursor_font_id: u32 = 0,
     invisible_cursor_id: u32 = 0,
-    system_cursors: [8]u32 = [_]u32{0} ** 8,
+    system_cursors: [cursor_count]u32 = [_]u32{0} ** cursor_count,
+
+    /// A message read while peeking past a KeyRelease for its auto-repeat
+    /// press, handed back by the next `receiveIo`.
+    held_message: ?x11.Message = null,
 
     keysym_map: []u32,
     keysyms_per_keycode: u8,
@@ -211,12 +215,47 @@ pub const WindowManager = struct {
     /// and returns `error.Canceled`. Internal no-op messages are skipped.
     pub fn receiveIo(self: *@This(), io: std.Io) !?common.Event {
         while (true) {
-            const message = try x11.receive(io, self.conn, .none) orelse continue;
-            switch (self.mapMessage(message)) {
+            const message = self.takeHeldMessage() orelse (try x11.receive(io, self.conn, .none) orelse continue);
+            const event = switch (message) {
+                .KeyRelease => |release| try self.mapKeyRelease(io, release),
+                else => self.mapMessage(message),
+            };
+            switch (event) {
                 .nop => {}, // ignored message — keep reading
-                else => |event| return event,
+                else => return event,
             }
         }
+    }
+
+    fn takeHeldMessage(self: *@This()) ?x11.Message {
+        const message = self.held_message orelse return null;
+        self.held_message = null;
+        return message;
+    }
+
+    /// Core X11 has no repeat flag: auto-repeat arrives as a KeyRelease
+    /// immediately followed by a KeyPress with the same timestamp and
+    /// keycode, in one server write. Peek briefly for that press and fold
+    /// the pair into a single repeated `key_pressed`; anything else read
+    /// while peeking is held for the next call.
+    fn mapKeyRelease(self: *@This(), io: std.Io, release: x11.proto.KeyRelease) !common.Event {
+        if (try x11.receive(io, self.conn, .{ .duration = .{ .raw = repeat_peek_window, .clock = .awake } })) |next| {
+            if (isAutoRepeatPair(release, next)) return self.mapKeyPress(next.KeyPress, true);
+            self.held_message = next;
+        }
+        return self.mapMessage(.{ .KeyRelease = release });
+    }
+
+    fn mapKeyPress(self: *@This(), key_press: x11.proto.KeyPress, repeat: bool) common.Event {
+        const keysym = self.lookupKeysym(key_press.keycode, key_press.state);
+        return .{ .key_pressed = .{
+            .scancode = keys.evdevToScancode(key_press.keycode -| 8),
+            .key = keys.x11KeysymToKey(keysym),
+            .modifiers = x11ModsFromState(key_press.state),
+            .codepoint = keys.keysymToCodepoint(keysym),
+            .repeat = repeat,
+            .window_id = key_press.event_window,
+        } };
     }
 
     /// Map a raw X11 message to a `common.Event` (`.nop` for messages we ignore).
@@ -258,20 +297,16 @@ pub const WindowManager = struct {
                         },
                     };
                 },
-                .KeyPress => |key_press| {
-                    const evdev_code = key_press.keycode -| 8;
-                    const sc = keys.evdevToScancode(evdev_code);
-                    const keysym = self.lookupKeysym(key_press.keycode, key_press.state);
-                    const key = keys.x11KeysymToKey(keysym);
-                    const mods = x11ModsFromState(key_press.state);
-                    return .{
-                        .key_pressed = .{
-                            .scancode = sc,
-                            .key = key,
-                            .modifiers = mods,
-                            .window_id = key_press.event_window,
-                        },
-                    };
+                .KeyPress => |key_press| return self.mapKeyPress(key_press, false),
+                // Grab-driven focus changes (a window manager's alt-tab popup
+                // taking the keyboard) are transient and not reported.
+                .FocusIn => |focus| {
+                    if (focus.mode == .Grab or focus.mode == .Ungrab) return .{ .nop = {} };
+                    return .{ .focus_in = focus.event };
+                },
+                .FocusOut => |focus| {
+                    if (focus.mode == .Grab or focus.mode == .Ungrab) return .{ .nop = {} };
+                    return .{ .focus_out = focus.event };
                 },
                 .ButtonRelease => |button_release| {
                     switch (button_release.keycode) {
@@ -431,6 +466,7 @@ pub const Window = struct {
             .ButtonPress,
             .ButtonRelease,
             .PointerMotion,
+            .FocusChange,
         };
         const window_values = x11.proto.WindowValue{
             .BackgroundPixel = commonPixelToX11Pixel(options.background),
@@ -694,6 +730,11 @@ pub const Window = struct {
     /// backend stays tick-paced and never emits `frame_done`.
     pub fn supportsFramePacing(_: *const @This()) bool {
         return false;
+    }
+
+    /// Physical pixels per logical unit, from Xft.dpi at connection time.
+    pub fn scale(self: *@This()) f32 {
+        return self.scaling;
     }
 
     /// No compositor frame callback on X11; nothing to arm.
@@ -1133,6 +1174,7 @@ test "nearestNeighbor single pixel upscale" {
     }
 }
 
+/// Glyph index in the X11 "cursor" font; the mask is the following glyph.
 fn cursorGlyph(cursor: common.Cursor) u16 {
     return switch (cursor) {
         .default => 2,
@@ -1143,7 +1185,40 @@ fn cursorGlyph(cursor: common.Cursor) u16 {
         .resize_ns => 116,
         .resize_ew => 108,
         .move => 52,
+        .wait => 150,
+        .resize_nwse => 14, // bottom_right_corner
+        .resize_nesw => 12, // bottom_left_corner
     };
+}
+
+const cursor_count = @typeInfo(common.Cursor).@"enum".fields.len;
+
+/// How long to wait for the KeyPress half of an auto-repeat pair. The pair
+/// leaves the server in one write, so a real repeat is already buffered.
+const repeat_peek_window = std.Io.Duration.fromMilliseconds(2);
+
+fn isAutoRepeatPair(release: x11.proto.KeyRelease, next: x11.Message) bool {
+    return switch (next) {
+        .KeyPress => |press| press.keycode == release.keycode and press.time == release.time,
+        else => false,
+    };
+}
+
+test "isAutoRepeatPair folds a same-time same-key release/press pair only" {
+    var release = std.mem.zeroes(x11.proto.KeyRelease);
+    release.keycode = 38;
+    release.time = 1000;
+    var press = std.mem.zeroes(x11.proto.KeyPress);
+    press.keycode = 38;
+    press.time = 1000;
+    try testing.expect(isAutoRepeatPair(release, .{ .KeyPress = press }));
+
+    press.time = 1001;
+    try testing.expect(!isAutoRepeatPair(release, .{ .KeyPress = press }));
+    press.time = 1000;
+    press.keycode = 39;
+    try testing.expect(!isAutoRepeatPair(release, .{ .KeyPress = press }));
+    try testing.expect(!isAutoRepeatPair(release, .{ .MotionNotify = std.mem.zeroes(x11.proto.MotionNotify) }));
 }
 
 /// RGB to ABGR

@@ -139,6 +139,13 @@ pub const Window = union(enum) {
         }
     }
 
+    /// Physical pixels per logical unit for this window right now.
+    pub fn scale(self: *@This()) f32 {
+        switch (self.*) {
+            inline else => |*window| return window.scale(),
+        }
+    }
+
     pub fn requestClose(self: *@This()) void {
         switch (self.*) {
             inline else => |*window| return window.requestClose(),

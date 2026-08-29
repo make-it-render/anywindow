@@ -193,6 +193,7 @@ fn printScale(window: *win.Window) void {
         },
         .x11 => {},
     }
+    std.debug.print("Window.scale(): {d}\n", .{window.scale()});
 }
 
 const std = @import("std");

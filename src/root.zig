@@ -22,6 +22,7 @@ pub const Key = common.Key;
 pub const Modifiers = common.Modifiers;
 pub const MouseButton = common.MouseButton;
 pub const Icon = common.Icon;
+pub const Cursor = common.Cursor;
 pub const WindowOptions = common.WindowOptions;
 pub const WindowStatus = common.WindowStatus;
 pub const Event = common.Event;

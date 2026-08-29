@@ -57,6 +57,14 @@ pub const WindowManager = struct {
     /// real bits, effective layout group).
     xkb_mods: u8 = 0,
     xkb_group: u32 = 0,
+    /// wl_keyboard.repeat_info: keys per second (0 = no repeat) and the
+    /// hold before the first repeat, in milliseconds.
+    repeat_rate: u32 = 25,
+    repeat_delay_ms: u32 = 600,
+    /// The key auto-repeating right now, if any.
+    held_key: ?HeldKey = null,
+    /// The task pacing repeats for `held_key`.
+    repeat_task: ?std.Io.Future(void) = null,
 
     // Shared with drawing threads — guarded by state_mutex.
     pointer_focus: common.WindowID = 0,
@@ -73,6 +81,9 @@ pub const WindowManager = struct {
     /// Sync-callback id -> the window whose `requestClose` asked to quit, so
     /// `callback_done` returns `.close` and the event loop stops.
     close_callbacks: std.AutoHashMapUnmanaged(u32, common.WindowID) = .empty,
+    /// Sync-callback ids the repeat task posted: each `callback_done` is one
+    /// repeat of `held_key`.
+    repeat_callbacks: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// Bound wl_output id -> integer scale. Only outputs present at init are
     /// tracked (hotplugged ones fall back to the per-surface scale signals).
     outputs: std.AutoHashMapUnmanaged(u32, u32) = .empty,
@@ -82,6 +93,9 @@ pub const WindowManager = struct {
     /// Windows whose buffers changed size (resize or rescale), waiting to be
     /// surfaced as .resize events by step().
     pending_resizes: std.ArrayList(u32) = .empty,
+    /// Windows whose scale factor changed, waiting to be surfaced as
+    /// .scale_changed events by step() — ahead of their .resize.
+    pending_scale_changes: std.ArrayList(u32) = .empty,
 
     pub fn init(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) !@This() {
         var self: @This() = .{
@@ -158,13 +172,16 @@ pub const WindowManager = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        self.stopRepeat();
         self.display.deinit();
         self.window_objects.deinit(self.allocator);
         self.redraw_callbacks.deinit(self.allocator);
         self.frame_callbacks.deinit(self.allocator);
         self.close_callbacks.deinit(self.allocator);
+        self.repeat_callbacks.deinit(self.allocator);
         self.outputs.deinit(self.allocator);
         self.pending_resizes.deinit(self.allocator);
+        self.pending_scale_changes.deinit(self.allocator);
         if (self.keymap) |*keymap| keymap.deinit();
     }
 
@@ -246,7 +263,7 @@ pub const WindowManager = struct {
     /// when the event was protocol bookkeeping or input state with nothing
     /// to surface.
     fn step(self: *@This(), io: std.Io) !?common.Event {
-        if (try self.takePendingResize(io)) |event| return event;
+        if (try self.takePendingEvent(io)) |event| return event;
         const event = try self.display.receive(io) orelse return null;
         switch (event) {
             .wm_base_ping => |serial| {
@@ -276,7 +293,7 @@ pub const WindowManager = struct {
             },
             .xdg_surface_configure => |configure| {
                 try self.handleConfigure(io, configure.xdg_surface, configure.serial);
-                return try self.takePendingResize(io);
+                return try self.takePendingEvent(io);
             },
             .surface_enter => |enter| {
                 self.state_mutex.lockUncancelable(io);
@@ -355,6 +372,20 @@ pub const WindowManager = struct {
                 if (self.close_callbacks.fetchRemove(done.callback_id)) |entry| {
                     return .{ .close = entry.value };
                 }
+                if (self.repeat_callbacks.remove(done.callback_id)) {
+                    // Ticks posted before a release or focus change can still
+                    // arrive; they map to nothing once the key is let go.
+                    const held = self.held_key orelse return null;
+                    if (held.window_id != self.keyboard_focus) return null;
+                    return .{ .key_pressed = .{
+                        .scancode = held.scancode,
+                        .key = held.key,
+                        .modifiers = self.modifiers,
+                        .codepoint = held.codepoint,
+                        .repeat = true,
+                        .window_id = held.window_id,
+                    } };
+                }
                 return null;
             },
             .pointer_enter => |enter| {
@@ -407,14 +438,20 @@ pub const WindowManager = struct {
             },
             .keyboard_enter => |enter| {
                 self.keyboard_focus = enter.surface;
-                return null;
+                return .{ .focus_in = enter.surface };
             },
             .keyboard_leave => |leave| {
+                self.stopRepeat();
                 if (self.keyboard_focus == leave.surface) self.keyboard_focus = 0;
-                return null;
+                return .{ .focus_out = leave.surface };
             },
             .keyboard_keymap => |keymap| {
                 self.loadKeymap(keymap);
+                return null;
+            },
+            .keyboard_repeat_info => |info| {
+                self.repeat_rate = if (info.rate > 0) @intCast(info.rate) else 0;
+                self.repeat_delay_ms = if (info.delay > 0) @intCast(info.delay) else 0;
                 return null;
             },
             .keyboard_modifiers => |mods| {
@@ -447,17 +484,28 @@ pub const WindowManager = struct {
                 // stays positional while the Key follows the active layout
                 // when a keymap is available (XKB keycode = evdev + 8).
                 const scancode = if (std.math.cast(u8, key.key)) |evdev| keys.evdevToScancode(evdev) else .unknown;
-                const mapped_key: keys.Key = if (self.keymap) |*keymap|
-                    keys.x11KeysymToKey(keymap.keysym(key.key + 8, self.xkb_mods, self.xkb_group))
-                else
-                    keys.scancodeToKey(scancode);
+                const keysym: ?u32 = if (self.keymap) |*keymap| keymap.keysym(key.key + 8, self.xkb_mods, self.xkb_group) else null;
+                const mapped_key: keys.Key = if (keysym) |sym| keys.x11KeysymToKey(sym) else keys.scancodeToKey(scancode);
+                const codepoint: ?u21 = if (keysym) |sym| keys.keysymToCodepoint(sym) else keys.keyToCodepoint(mapped_key, self.modifiers);
                 if (key.state == proto.wayland.state_pressed) {
+                    self.startRepeat(.{
+                        .evdev = key.key,
+                        .scancode = scancode,
+                        .key = mapped_key,
+                        .codepoint = codepoint,
+                        .window_id = self.keyboard_focus,
+                    });
                     return .{ .key_pressed = .{
                         .scancode = scancode,
                         .key = mapped_key,
                         .modifiers = self.modifiers,
+                        .codepoint = codepoint,
+                        .repeat = false,
                         .window_id = self.keyboard_focus,
                     } };
+                }
+                if (self.held_key) |held| {
+                    if (held.evdev == key.key) self.stopRepeat();
                 }
                 return .{ .key_released = .{
                     .scancode = scancode,
@@ -468,6 +516,57 @@ pub const WindowManager = struct {
             },
             else => return null,
         }
+    }
+
+    /// Begin auto-repeating a pressed key: remember it and start the task
+    /// that posts a repeat tick every `1000 / repeat_rate` ms after the
+    /// delay. Receive-task only. Without concurrency (single-threaded Io)
+    /// keys simply do not repeat.
+    fn startRepeat(self: *@This(), held: HeldKey) void {
+        self.stopRepeat();
+        if (self.repeat_rate == 0 or !keys.repeats(held.key)) return;
+        self.held_key = held;
+        const interval_ms = @max(1, 1000 / self.repeat_rate);
+        self.repeat_task = self.io.concurrent(repeatTask, .{ self, self.repeat_delay_ms, interval_ms }) catch |err| {
+            log.debug("Key repeat unavailable: {any}", .{err});
+            self.held_key = null;
+            return;
+        };
+    }
+
+    /// Stop auto-repeat and wait for its task to finish. Receive-task only.
+    fn stopRepeat(self: *@This()) void {
+        self.held_key = null;
+        if (self.repeat_task) |*task| {
+            task.cancel(self.io);
+            self.repeat_task = null;
+        }
+    }
+
+    /// Runs beside the receive task. A blocked socket read only wakes for
+    /// server traffic, so each tick is a wl_display.sync whose callback_done
+    /// the receive task turns into a repeated key_pressed.
+    fn repeatTask(self: *@This(), delay_ms: u32, interval_ms: u32) void {
+        self.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch return;
+        while (true) {
+            self.postRepeatTick() catch return;
+            self.io.sleep(std.Io.Duration.fromMilliseconds(interval_ms), .awake) catch return;
+        }
+    }
+
+    fn postRepeatTick(self: *@This()) !void {
+        const callback_id = try self.display.newId(.callback);
+        {
+            self.state_mutex.lockUncancelable(self.io);
+            defer self.state_mutex.unlock(self.io);
+            try self.repeat_callbacks.put(self.allocator, callback_id, {});
+        }
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            try proto.wayland.display.sync(writer, callback_id);
+        }
+        try self.display.flush();
     }
 
     fn handleConfigure(self: *@This(), io: std.Io, xdg_surface_id: u32, serial: u32) !void {
@@ -499,6 +598,7 @@ pub const WindowManager = struct {
         const height = physicalLength(shared.logical_height, scale120);
         if (scale120 == shared.scale120 and width == shared.width and height == shared.height) return;
 
+        if (scale120 != shared.scale120) try queueWindow(self.allocator, &self.pending_scale_changes, shared.surface);
         shared.scale120 = scale120;
         shared.width = width;
         shared.height = height;
@@ -522,10 +622,15 @@ pub const WindowManager = struct {
             }
         }
 
-        for (self.pending_resizes.items) |queued| {
-            if (queued == shared.surface) return;
+        try queueWindow(self.allocator, &self.pending_resizes, shared.surface);
+    }
+
+    /// Append a window id unless it is already queued.
+    fn queueWindow(allocator: std.mem.Allocator, list: *std.ArrayList(u32), window_id: u32) !void {
+        for (list.items) |queued| {
+            if (queued == window_id) return;
         }
-        try self.pending_resizes.append(self.allocator, shared.surface);
+        try list.append(allocator, window_id);
     }
 
     /// A window's preferred scale in 120ths, constrained to what the
@@ -560,10 +665,16 @@ pub const WindowManager = struct {
         self.default_scale120 = best;
     }
 
-    /// Pop one queued .resize, skipping windows that were destroyed since.
-    fn takePendingResize(self: *@This(), io: std.Io) !?common.Event {
+    /// Pop one queued .scale_changed or .resize (scale changes first, so a
+    /// resize always arrives with the scale already known), skipping windows
+    /// that were destroyed since.
+    fn takePendingEvent(self: *@This(), io: std.Io) !?common.Event {
         self.state_mutex.lockUncancelable(io);
         defer self.state_mutex.unlock(io);
+        while (self.pending_scale_changes.pop()) |window_id| {
+            const shared = self.window_objects.get(window_id) orelse continue;
+            return .{ .scale_changed = .{ .window_id = shared.surface, .scale = scaleFactor(shared.scale120) } };
+        }
         while (self.pending_resizes.pop()) |window_id| {
             const shared = self.window_objects.get(window_id) orelse continue;
             return .{ .resize = .{ .width = shared.width, .height = shared.height, .window_id = shared.surface } };
@@ -610,6 +721,16 @@ pub const WindowManager = struct {
         slot.shm.deinit();
         self.allocator.destroy(slot);
     }
+};
+
+/// A key being auto-repeated: what the original press reported, re-emitted
+/// with `repeat = true` on every tick.
+const HeldKey = struct {
+    evdev: u32,
+    scancode: common.Scancode,
+    key: common.Key,
+    codepoint: ?u21,
+    window_id: common.WindowID,
 };
 
 /// Per-window state both the receive task and drawing threads reach, so it
@@ -1065,6 +1186,14 @@ pub const Window = struct {
         return true;
     }
 
+    /// The window's current scale: physical buffer pixels per logical unit.
+    pub fn scale(self: *@This()) f32 {
+        const wm = self.wm;
+        wm.state_mutex.lockUncancelable(wm.io);
+        defer wm.state_mutex.unlock(wm.io);
+        return scaleFactor(self.shared.scale120);
+    }
+
     /// Ask for a `frame_done` event when the compositor is next about to
     /// repaint, so a render can land on a display refresh. One-shot: call it
     /// again from each `frame_done` to keep a steady loop. The callback is
@@ -1210,6 +1339,11 @@ pub const Image = struct {
     }
 };
 
+/// 120ths to a plain scale factor.
+fn scaleFactor(scale120: u32) f32 {
+    return @as(f32, @floatFromInt(scale120)) / 120.0;
+}
+
 /// Logical 24.8 fixed-point to physical pixels at the given scale.
 fn coordinate(value: wl.wire.Fixed, scale120: u32) i16 {
     const pixels = @divTrunc(@as(i64, value) * scale120, 120 * 256);
@@ -1251,6 +1385,9 @@ fn shapeFromCursor(cursor: common.Cursor) proto.cursor_shape.Shape {
         .resize_ns => .ns_resize,
         .resize_ew => .ew_resize,
         .move => .move,
+        .wait => .wait,
+        .resize_nwse => .nwse_resize,
+        .resize_nesw => .nesw_resize,
     };
 }
 

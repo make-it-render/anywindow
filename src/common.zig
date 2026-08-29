@@ -90,6 +90,12 @@ pub const Event = union(enum) {
         scancode: Scancode,
         key: Key,
         modifiers: Modifiers,
+        /// The character this key types under the active layout and
+        /// modifiers, or null for keys that type nothing (function,
+        /// navigation and modifier keys, dead keys, control combinations).
+        codepoint: ?u21 = null,
+        /// True for the presses auto-repeat generates while the key is held.
+        repeat: bool = false,
         window_id: WindowID,
     },
     key_released: struct {
@@ -103,6 +109,17 @@ pub const Event = union(enum) {
         height: Height,
         window_id: WindowID,
     },
+    /// The window gained keyboard focus.
+    focus_in: WindowID,
+    /// The window lost keyboard focus.
+    focus_out: WindowID,
+    /// The window's scale factor (physical pixels per logical unit) changed,
+    /// typically because it moved to a display with a different DPI. A
+    /// `resize` with the new physical size follows when the buffer changed.
+    scale_changed: struct {
+        window_id: WindowID,
+        scale: f32,
+    },
 };
 
 pub const Cursor = enum {
@@ -114,6 +131,11 @@ pub const Cursor = enum {
     resize_ns,
     resize_ew,
     move,
+    wait,
+    /// Diagonal resize, top-left to bottom-right.
+    resize_nwse,
+    /// Diagonal resize, top-right to bottom-left.
+    resize_nesw,
 };
 
 pub const keys = @import("keys.zig");

@@ -80,6 +80,18 @@ pub fn main(init: std.process.Init) !void {
                         window.setCursor(.move);
                         log.info("cursor: move", .{});
                     },
+                    .@"9" => {
+                        window.setCursor(.wait);
+                        log.info("cursor: wait", .{});
+                    },
+                    .@"0" => {
+                        window.setCursor(.resize_nwse);
+                        log.info("cursor: resize_nwse", .{});
+                    },
+                    .minus => {
+                        window.setCursor(.resize_nesw);
+                        log.info("cursor: resize_nesw", .{});
+                    },
                     .h => {
                         window.hideCursor();
                         log.info("cursor: hidden", .{});
@@ -98,8 +110,14 @@ pub fn main(init: std.process.Init) !void {
                     },
                     else => {},
                 }
+                if (kp.codepoint) |codepoint| {
+                    log.info("typed U+{X:0>4}{s}", .{ codepoint, if (kp.repeat) " (repeat)" else "" });
+                }
                 try window.redraw(.{});
             },
+            .focus_in => log.info("focus in", .{}),
+            .focus_out => log.info("focus out", .{}),
+            .scale_changed => |change| log.info("scale {d}", .{change.scale}),
             .mouse_pressed, .mouse_released, .key_released => {
                 try window.redraw(.{});
             },
