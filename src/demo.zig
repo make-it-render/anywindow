@@ -115,6 +115,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 try window.redraw(.{});
             },
+            .text => |text| log.info("composed U+{X:0>4}", .{text.codepoint}),
             .focus_in => log.info("focus in", .{}),
             .focus_out => log.info("focus out", .{}),
             .scale_changed => |change| log.info("scale {d}", .{change.scale}),

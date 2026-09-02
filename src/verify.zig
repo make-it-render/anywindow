@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try pump(io, &wm, &window);
     printScale(&window);
     printKeymap(&wm);
+    try verifyKeys(io, &wm, &window);
 
     // 64x64 quadrant test pattern, opaque.
     var icon_pixels: [64 * 64 * 4]u8 = undefined;
@@ -415,6 +416,159 @@ fn printKeymap(wm: *win.WindowManager) void {
 fn printable(keysym: u32) u8 {
     if (keysym >= 0x20 and keysym < 0x7F) return @intCast(keysym);
     return '?';
+}
+
+/// A synthetic key press: the keycode and the state bits that select one of its columns.
+const Press = struct {
+    keycode: u8,
+    state: u16,
+
+    fn with(self: Press, bits: u16) Press {
+        return .{ .keycode = self.keycode, .state = self.state | bits };
+    }
+};
+
+const state_shift: u16 = 0x01;
+const state_lock: u16 = 0x02;
+const state_group_two: u16 = 1 << 13;
+const keysym_euro: u32 = 0x20AC;
+const keysym_kp_seven: u32 = 0xFFB7;
+const keysym_dead_circumflex: u32 = 0xFE52;
+const keysym_escape: u32 = 0xFF1B;
+
+/// Drive the keyboard path with synthetic presses on X11. `SendEvent` delivers a KeyPress to our own window through the server, so mapping, levels, locks and compose run against the live keymap. Wayland has no client-side way to inject input, so only the keymap is printed there.
+fn verifyKeys(io: std.Io, wm: *win.WindowManager, window: *win.Window) !void {
+    const backend = switch (wm.*) {
+        .x11 => |*x| x,
+        .wayland => {
+            std.debug.print("keys: not driven on Wayland (no input injection protocol)\n", .{});
+            return;
+        },
+    };
+    std.debug.print("keymap: {d} keysyms per keycode, level3 mask 0x{x}, num lock mask 0x{x}, mode switch mask 0x{x}\n", .{ backend.keysyms_per_keycode, backend.level3_mask, backend.num_lock_mask, backend.mode_switch_mask });
+
+    const letter = findKeysym(backend, 'a', 0) orelse {
+        std.debug.print("keys: no 'a' in the keymap, skipped\n", .{});
+        return;
+    };
+    printColumns(backend, letter.keycode);
+    try expectTyped(io, wm, window, &.{letter}, &.{'a'}, "plain letter");
+    try expectTyped(io, wm, window, &.{letter.with(state_lock)}, &.{'A'}, "caps lock");
+    try expectTyped(io, wm, window, &.{letter.with(state_shift)}, &.{'A'}, "shift");
+    try expectTyped(io, wm, window, &.{letter.with(state_shift | state_lock)}, &.{'a'}, "shift under caps lock");
+
+    if (backend.num_lock_mask != 0) {
+        if (findKeysym(backend, keysym_kp_seven, 0)) |keypad| {
+            try expectTyped(io, wm, window, &.{.{ .keycode = keypad.keycode, .state = backend.num_lock_mask }}, &.{'7'}, "keypad under num lock");
+            try expectTyped(io, wm, window, &.{.{ .keycode = keypad.keycode, .state = 0 }}, &.{}, "keypad without num lock");
+        }
+    } else {
+        std.debug.print("keys: Num_Lock is bound to no modifier, keypad skipped\n", .{});
+    }
+
+    if (findKeysym(backend, keysym_euro, 0)) |euro| {
+        printColumns(backend, euro.keycode);
+        try expectTyped(io, wm, window, &.{euro}, &.{keysym_euro}, "level 3 euro sign");
+    } else {
+        std.debug.print("keys: no EuroSign in the keymap, level 3 skipped\n", .{});
+    }
+
+    const hat = findKeysym(backend, keysym_dead_circumflex, 0) orelse {
+        std.debug.print("keys: no dead_circumflex in the keymap, compose skipped\n", .{});
+        return;
+    };
+    const group = hat.state & state_group_two;
+    const letter_e = findKeysym(backend, 'e', group) orelse return error.NoLetterE;
+    const letter_x = findKeysym(backend, 'x', group) orelse return error.NoLetterX;
+    const escape = findKeysym(backend, keysym_escape, 0) orelse return error.NoEscape;
+    printColumns(backend, hat.keycode);
+    try expectTyped(io, wm, window, &.{ hat, letter_e }, &.{0xEA}, "dead circumflex then e");
+    try expectTyped(io, wm, window, &.{ hat, letter_e.with(state_shift) }, &.{0xCA}, "dead circumflex then shift e");
+    try expectTyped(io, wm, window, &.{ hat, hat }, &.{'^'}, "dead circumflex twice");
+    try expectTyped(io, wm, window, &.{ hat, letter_x }, &.{ '^', 'x' }, "dead circumflex then x");
+    try expectTyped(io, wm, window, &.{ hat, escape, letter_e }, &.{'e'}, "escape cancels a dead key");
+}
+
+/// A press that types `keysym`, preferring a column in the group `group_state` selects (0 for the first group).
+fn findKeysym(backend: *win.x11.WindowManager, keysym: u32, group_state: u16) ?Press {
+    var fallback: ?Press = null;
+    var keycode: usize = backend.min_keycode;
+    while (keycode <= backend.max_keycode) : (keycode += 1) {
+        const columns = backend.keysymColumns(@intCast(keycode)) orelse continue;
+        for (columns, 0..) |candidate, column| {
+            if (candidate != keysym) continue;
+            const press: Press = .{ .keycode = @intCast(keycode), .state = backend.stateForColumn(column) };
+            // The column model has to read back what it predicts, or the press proves nothing.
+            if (backend.lookupKeysym(press.keycode, press.state) != keysym) continue;
+            if (press.state & state_group_two == group_state) return press;
+            if (fallback == null) fallback = press;
+        }
+    }
+    return fallback;
+}
+
+fn printColumns(backend: *win.x11.WindowManager, keycode: u8) void {
+    std.debug.print("keycode {d}:", .{keycode});
+    for (backend.keysymColumns(keycode) orelse &.{}) |keysym| std.debug.print(" 0x{x}", .{keysym});
+    std.debug.print("\n", .{});
+}
+
+/// Send `presses` to our window through the server and check the characters that come back, from `key_pressed` codepoints and `text` events in order.
+fn expectTyped(io: std.Io, wm: *win.WindowManager, window: *win.Window, presses: []const Press, expected: []const u21, what: []const u8) !void {
+    const backend = &wm.x11;
+    const window_id = window.x11.window_id;
+    for (presses) |press| {
+        const event = x11.proto.KeyPress{
+            .keycode = press.keycode,
+            .sequence_number = 0,
+            .time = 0,
+            .root_window = window.x11.root,
+            .event_window = window_id,
+            .child_window = 0,
+            .root_x = 0,
+            .root_y = 0,
+            .event_x = 0,
+            .event_y = 0,
+            .state = press.state,
+            .same_screen = 1,
+            .pad = .{0},
+        };
+        try x11.send(io, backend.conn, x11.proto.SendEvent{ .destination = window_id, .event_mask = 0, .event = std.mem.toBytes(event) });
+    }
+
+    var typed: [16]u21 = undefined;
+    var typed_len: usize = 0;
+    var pressed: usize = 0;
+    try window.redraw(.{});
+    collect: while (try wm.receiveIo(io)) |event| {
+        switch (event) {
+            .draw => break :collect,
+            .key_pressed => |press| {
+                pressed += 1;
+                if (press.codepoint) |codepoint| {
+                    if (typed_len < typed.len) typed[typed_len] = codepoint;
+                    typed_len += 1;
+                }
+            },
+            .text => |text| {
+                if (typed_len < typed.len) typed[typed_len] = text.codepoint;
+                typed_len += 1;
+            },
+            .close => return error.WindowClosed,
+            else => {},
+        }
+    }
+
+    const got = typed[0..@min(typed_len, typed.len)];
+    if (pressed != presses.len or !std.mem.eql(u21, got, expected)) {
+        std.debug.print("keys: {s}: {d} presses came back as {d}, typed", .{ what, presses.len, pressed });
+        for (got) |codepoint| std.debug.print(" U+{X:0>4}", .{codepoint});
+        std.debug.print(", expected", .{});
+        for (expected) |codepoint| std.debug.print(" U+{X:0>4}", .{codepoint});
+        std.debug.print("\n", .{});
+        return error.KeyMismatch;
+    }
+    std.debug.print("keys: {s}: ok\n", .{what});
 }
 
 /// No event loop task is running, so reading backend state without the

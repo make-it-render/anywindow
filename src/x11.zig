@@ -64,6 +64,15 @@ pub const WindowManager = struct {
     keysyms_per_keycode: u8,
     min_keycode: u8,
     max_keycode: u8,
+    /// The state bits the server binds ISO_Level3_Shift to, from `GetModifierMapping`; Mod5 when it binds none.
+    level3_mask: u16,
+    /// The state bits the server binds Mode_switch to; zero when it binds none.
+    mode_switch_mask: u16,
+    /// The state bits the server binds Num_Lock to; zero when it binds none.
+    num_lock_mask: u16,
+    compose: Compose,
+    /// Events a key press produced beyond its own `key_pressed`; `receiveIo` drains it before reading the socket.
+    queued: EventQueue = .{},
 
     pub fn init(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) !@This() {
         const conn = try x11.connect(io, environ, .{});
@@ -131,6 +140,13 @@ pub const WindowManager = struct {
             try x11.receiveBytes(io, conn, keysym_bytes);
         }
 
+        const modifier_masks = queryModifierMasks(io, conn, allocator, keysym_map, keysyms_per_keycode, min_kc) catch |err| blk: {
+            log.debug("GetModifierMapping failed ({any}); level 3 assumed on Mod5", .{err});
+            break :blk ModifierMasks{};
+        };
+        var compose = Compose.load(io, allocator, environ);
+        errdefer compose.deinit();
+
         // Open the X11 "cursor" font for standard cursor shapes
         const cursor_font_id = try xid.genID();
         const cursor_font_name = "cursor";
@@ -191,6 +207,10 @@ pub const WindowManager = struct {
             .keysyms_per_keycode = keysyms_per_keycode,
             .min_keycode = min_kc,
             .max_keycode = max_kc,
+            .level3_mask = modifier_masks.level3,
+            .mode_switch_mask = modifier_masks.mode_switch,
+            .num_lock_mask = modifier_masks.num_lock,
+            .compose = compose,
         };
     }
 
@@ -209,6 +229,7 @@ pub const WindowManager = struct {
         }
 
         self.allocator.free(self.keysym_map);
+        self.compose.deinit();
         self.in_flight.deinit(self.allocator);
         if (self.clipboard_text) |text| self.allocator.free(text);
         if (self.paste_result) |text| self.allocator.free(text);
@@ -254,6 +275,7 @@ pub const WindowManager = struct {
     /// and returns `error.Canceled`. Internal no-op messages are skipped.
     pub fn receiveIo(self: *@This(), io: std.Io) !?common.Event {
         while (true) {
+            if (self.queued.pop()) |event| return event;
             const message = self.takeHeldMessage() orelse (try x11.receive(io, self.conn, .none) orelse continue);
             const event = switch (message) {
                 .KeyRelease => |release| try self.mapKeyRelease(io, release),
@@ -306,14 +328,33 @@ pub const WindowManager = struct {
 
     fn mapKeyPress(self: *@This(), key_press: x11.proto.KeyPress, repeat: bool) common.Event {
         const keysym = self.lookupKeysym(key_press.keycode, key_press.state);
-        return .{ .key_pressed = .{
+        const window_id = key_press.event_window;
+        // Auto-repeat stays out of sequences: a held dead key arms once, and a held letter after a composition types plainly.
+        const step: Compose.Step = if (repeat) .ignored else self.compose.feed(keysym);
+        const typed: ?u21 = switch (step) {
+            .ignored => keys.keysymToCodepoint(keysym),
+            .pending, .composed => null,
+            .cancelled => |cancelled| if (cancelled.restarted) null else keys.keysymToCodepoint(keysym),
+        };
+        const pressed: common.Event = .{ .key_pressed = .{
             .scancode = keys.evdevToScancode(key_press.keycode -| 8),
             .key = keys.x11KeysymToKey(keysym),
             .modifiers = x11ModsFromState(key_press.state),
-            .codepoint = keys.keysymToCodepoint(keysym),
+            .codepoint = typed,
             .repeat = repeat,
-            .window_id = key_press.event_window,
+            .window_id = window_id,
         } };
+        switch (step) {
+            .composed => |text| self.queued.pushText(text.slice(), window_id),
+            // The accents a broken sequence leaves behind were typed before this key.
+            .cancelled => |cancelled| if (cancelled.text.len > 0) {
+                self.queued.pushText(cancelled.text.slice(), window_id);
+                self.queued.push(pressed);
+                return self.queued.pop().?;
+            },
+            else => {},
+        }
+        return pressed;
     }
 
     /// Map a raw X11 message to a `common.Event` (`.nop` for messages we ignore).
@@ -363,6 +404,7 @@ pub const WindowManager = struct {
                     return .{ .focus_in = focus.event };
                 },
                 .FocusOut => |focus| {
+                    self.compose.cancel();
                     if (focus.mode == .Grab or focus.mode == .Ungrab) return .{ .nop = {} };
                     return .{ .focus_out = focus.event };
                 },
@@ -475,22 +517,42 @@ pub const WindowManager = struct {
         };
     }
 
-    pub fn lookupKeysym(self: *@This(), keycode: u8, state: u16) u32 {
-        if (keycode < self.min_keycode or keycode > self.max_keycode) return 0;
-        const offset = keycode - self.min_keycode;
-        const base: usize = @as(usize, offset) * @as(usize, self.keysyms_per_keycode);
-        if (base >= self.keysym_map.len) return 0;
+    /// The keysym a press of `keycode` types under `state`: the core protocol's rules with XKB's level-3 column. AltGr picks the level-3 pair, Shift the upper keysym, Caps Lock upper-cases letter pairs, Num Lock picks the keypad digit.
+    pub fn lookupKeysym(self: *const @This(), keycode: u8, state: u16) u32 {
+        const columns = self.keysymColumns(keycode) orelse return 0;
+        const shift = state & state_shift != 0;
+        const lock = state & state_lock != 0;
+        const level3 = state & self.level3_mask != 0;
+        const num_lock = state & self.num_lock_mask != 0;
+        // An XKB server puts the effective group in bits 13-14; a core server switches groups with Mode_switch.
+        var group: usize = (state >> 13) & 3;
+        if (group == 0 and state & self.mode_switch_mask != 0) group = 1;
 
-        // Column 0 = unshifted, column 1 = shifted
-        const shifted = (state & 0x01) != 0; // Shift bit in KeyButMask
-        const col: usize = if (shifted and self.keysyms_per_keycode > 1) 1 else 0;
-        const idx = base + col;
-        if (idx >= self.keysym_map.len) return 0;
+        const pair = keysymPair(columns, group, level3);
+        const lower = pair[0];
+        if (lower == 0) return if (shift) pair[1] else 0;
+        const upper = if (pair[1] != 0) pair[1] else impliedUpper(lower);
+        if (wl.xkb.keysym.isKeypad(lower) or wl.xkb.keysym.isKeypad(upper)) return if (num_lock != shift) upper else lower;
+        if (wl.xkb.keysym.isAlphaPair(lower, upper)) return if (shift != lock) upper else lower;
+        return if (shift) upper else lower;
+    }
 
-        const sym = self.keysym_map[idx];
-        // If shifted column is NoSymbol (0), fall back to unshifted
-        if (sym == 0 and col == 1) return self.keysym_map[base];
-        return sym;
+    /// The keysym columns of `keycode`, `keysyms_per_keycode` long; null off the keyboard's range.
+    pub fn keysymColumns(self: *const @This(), keycode: u8) ?[]const u32 {
+        if (keycode < self.min_keycode or keycode > self.max_keycode) return null;
+        const per_keycode: usize = self.keysyms_per_keycode;
+        const base = @as(usize, keycode - self.min_keycode) * per_keycode;
+        if (base + per_keycode > self.keysym_map.len) return null;
+        return self.keysym_map[base .. base + per_keycode];
+    }
+
+    /// The state under which `lookupKeysym` reads `column` of a key: Shift for odd columns, the second group for columns 2, 3 and 6 up, level 3 for columns 4 up.
+    pub fn stateForColumn(self: *const @This(), column: usize) u16 {
+        var state: u16 = 0;
+        if (column % 2 == 1) state |= state_shift;
+        if (column == 2 or column == 3 or column >= 6) state |= state_group_two;
+        if (column >= 4) state |= self.level3_mask;
+        return state;
     }
 
     /// The most text a single ChangeProperty can carry on this server, capped at
@@ -1678,6 +1740,78 @@ fn getDesktopScaling(io: std.Io, environ: std.process.Environ, allocator: std.me
 
     return scaling / 96;
 }
+
+const state_shift: u16 = 0x01;
+const state_lock: u16 = 0x02;
+/// XKB group 2 in the state's group bits.
+const state_group_two: u16 = 1 << 13;
+const keysym_level3_shift: u32 = 0xFE03;
+const keysym_mode_switch: u32 = 0xFF7E;
+const keysym_num_lock: u32 = 0xFF7F;
+
+/// The (lower, upper) keysyms of a group and level as the core mapping lays them out: group 1's first two levels, group 2's, then each group's levels 3 and 4 in turn. The core protocol does not say how wide each group is. Group 2's level 3 is read at column 6 when that exists and at column 4 otherwise.
+fn keysymPair(columns: []const u32, group: usize, level3: bool) [2]u32 {
+    const second_group = group != 0 and (columnAt(columns, 2) != 0 or columnAt(columns, 3) != 0);
+    var base: usize = if (second_group) 2 else 0;
+    if (level3) {
+        if (second_group and columnAt(columns, 6) != 0) {
+            base = 6;
+        } else if (columnAt(columns, 4) != 0) {
+            base = 4;
+        }
+    }
+    return .{ columnAt(columns, base), columnAt(columns, base + 1) };
+}
+
+fn columnAt(columns: []const u32, index: usize) u32 {
+    return if (index < columns.len) columns[index] else 0;
+}
+
+/// A lone lowercase letter implies its uppercase, as the core protocol reads a single-keysym key.
+fn impliedUpper(lower: u32) u32 {
+    const candidate = lower -| 0x20;
+    return if (wl.xkb.keysym.isAlphaPair(lower, candidate)) candidate else lower;
+}
+
+const ModifierMasks = struct {
+    /// Mod5, where XKB keymaps bind ISO_Level3_Shift by default.
+    level3: u16 = 0x80,
+    mode_switch: u16 = 0,
+    num_lock: u16 = 0,
+};
+
+/// Which modifier bits carry ISO_Level3_Shift, Mode_switch and Num_Lock: `GetModifierMapping` lists keycodes per modifier, and each keycode's first keysym says what it is. Only the first keysym counts, as in xmodmap: on a two-layout keyboard Alt_R can carry ISO_Level3_Shift in its second group without being a level-3 modifier.
+fn queryModifierMasks(io: std.Io, conn: std.Io.net.Stream, allocator: std.mem.Allocator, keysym_map: []const u32, keysyms_per_keycode: u8, min_keycode: u8) !ModifierMasks {
+    try x11.send(io, conn, x11.proto.GetModifierMapping{});
+    const reply = (try x11.receiveReply(io, conn, x11.proto.GetModifierMappingReply)) orelse return error.NoModifierMapping;
+    const keycodes = try allocator.alloc(u8, reply.keycodeBytes());
+    defer allocator.free(keycodes);
+    try x11.receiveBytes(io, conn, keycodes);
+
+    var masks: ModifierMasks = .{};
+    var level3_bound = false;
+    const per_modifier: usize = reply.keycodes_per_modifier;
+    const per_keycode: usize = keysyms_per_keycode;
+    for (0..8) |modifier| {
+        const bit: u16 = @as(u16, 1) << @intCast(modifier);
+        for (keycodes[modifier * per_modifier .. (modifier + 1) * per_modifier]) |keycode| {
+            if (keycode < min_keycode) continue;
+            const base = @as(usize, keycode - min_keycode) * per_keycode;
+            if (base + per_keycode > keysym_map.len or per_keycode == 0) continue;
+            switch (keysym_map[base]) {
+                keysym_level3_shift => {
+                    masks.level3 = if (level3_bound) masks.level3 | bit else bit;
+                    level3_bound = true;
+                },
+                keysym_mode_switch => masks.mode_switch |= bit,
+                keysym_num_lock => masks.num_lock |= bit,
+                else => {},
+            }
+        }
+    }
+    return masks;
+}
+
 fn x11ModsFromState(state: u16) common.Modifiers {
     return .{
         .shift = (state & 0x01) != 0, // ShiftMask
@@ -1721,7 +1855,10 @@ const Atoms = struct {
 const std = @import("std");
 const testing = std.testing;
 const x11 = @import("x11");
+const wl = @import("wayland");
 const common = @import("common.zig");
 const keys = @import("keys.zig");
+const Compose = @import("compose.zig");
+const EventQueue = @import("event_queue.zig");
 
 const log = std.log.scoped(.any_x11);

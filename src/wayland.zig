@@ -77,6 +77,9 @@ pub const WindowManager = struct {
     held_key: ?HeldKey = null,
     /// The task pacing repeats for `held_key`.
     repeat_task: ?std.Io.Future(void) = null,
+    compose: Compose,
+    /// Events a key press produced beyond its own `key_pressed`; `step` returns them before reading the socket.
+    queued: EventQueue = .{},
 
     // Shared with drawing threads — guarded by state_mutex.
     pointer_focus: common.WindowID = 0,
@@ -128,8 +131,10 @@ pub const WindowManager = struct {
             .io = io,
             .allocator = allocator,
             .display = try wl.Display.init(io, environ, allocator),
+            .compose = Compose.load(io, allocator, environ),
         };
         errdefer self.display.deinit();
+        errdefer self.compose.deinit();
 
         try self.display.discoverGlobals(io);
 
@@ -224,6 +229,7 @@ pub const WindowManager = struct {
         self.pending_resizes.deinit(self.allocator);
         self.pending_scale_changes.deinit(self.allocator);
         if (self.keymap) |*keymap| keymap.deinit();
+        self.compose.deinit();
     }
 
     /// Parse a wl_keyboard.keymap payload, replacing the active keymap.
@@ -485,6 +491,7 @@ pub const WindowManager = struct {
             },
             .keyboard_leave => |leave| {
                 self.stopRepeat();
+                self.compose.cancel();
                 if (self.keyboard_focus == leave.surface) self.keyboard_focus = 0;
                 return .{ .focus_out = leave.surface };
             },
@@ -532,6 +539,7 @@ pub const WindowManager = struct {
                 const mapped_key: keys.Key = if (keysym) |sym| keys.x11KeysymToKey(sym) else keys.scancodeToKey(scancode);
                 const codepoint: ?u21 = if (keysym) |sym| keys.keysymToCodepoint(sym) else keys.keyToCodepoint(mapped_key, self.modifiers);
                 if (key.state == proto.wayland.state_pressed) {
+                    // Repeats carry the plain codepoint: a held dead key arms once, and a held letter after a composition types plainly.
                     self.startRepeat(.{
                         .evdev = key.key,
                         .scancode = scancode,
@@ -539,14 +547,31 @@ pub const WindowManager = struct {
                         .codepoint = codepoint,
                         .window_id = self.keyboard_focus,
                     });
-                    return .{ .key_pressed = .{
+                    const compose_step: Compose.Step = if (keysym) |sym| self.compose.feed(sym) else .ignored;
+                    const typed: ?u21 = switch (compose_step) {
+                        .ignored => codepoint,
+                        .pending, .composed => null,
+                        .cancelled => |cancelled| if (cancelled.restarted) null else codepoint,
+                    };
+                    const pressed: common.Event = .{ .key_pressed = .{
                         .scancode = scancode,
                         .key = mapped_key,
                         .modifiers = self.modifiers,
-                        .codepoint = codepoint,
+                        .codepoint = typed,
                         .repeat = false,
                         .window_id = self.keyboard_focus,
                     } };
+                    switch (compose_step) {
+                        .composed => |text| self.queued.pushText(text.slice(), self.keyboard_focus),
+                        // The accents a broken sequence leaves behind were typed before this key.
+                        .cancelled => |cancelled| if (cancelled.text.len > 0) {
+                            self.queued.pushText(cancelled.text.slice(), self.keyboard_focus);
+                            self.queued.push(pressed);
+                            return self.queued.pop();
+                        },
+                        else => {},
+                    }
+                    return pressed;
                 }
                 if (self.held_key) |held| {
                     if (held.evdev == key.key) self.stopRepeat();
@@ -758,6 +783,7 @@ pub const WindowManager = struct {
     /// resize always arrives with the scale already known), skipping windows
     /// that were destroyed since.
     fn takePendingEvent(self: *@This(), io: std.Io) !?common.Event {
+        if (self.queued.pop()) |event| return event;
         self.state_mutex.lockUncancelable(io);
         defer self.state_mutex.unlock(io);
         while (self.pending_scale_changes.pop()) |window_id| {
@@ -1858,5 +1884,7 @@ const wl = @import("wayland");
 const proto = wl.proto;
 const common = @import("common.zig");
 const keys = @import("keys.zig");
+const Compose = @import("compose.zig");
+const EventQueue = @import("event_queue.zig");
 
 const log = std.log.scoped(.any_wayland);

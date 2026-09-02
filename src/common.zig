@@ -115,6 +115,14 @@ pub const Event = union(enum) {
         modifiers: Modifiers,
         window_id: WindowID,
     },
+    /// A character no single key press typed: what a dead-key or compose
+    /// sequence types, or the spacing accent of a sequence that broke. It
+    /// follows the `key_pressed` events of the sequence, which carry a null
+    /// `codepoint`, so a character arrives exactly once.
+    text: struct {
+        codepoint: u21,
+        window_id: WindowID,
+    },
     resize: struct {
         width: Width,
         height: Height,
