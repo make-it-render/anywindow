@@ -42,8 +42,20 @@ pub const WindowManager = struct {
     pointer: u32 = 0,
     keyboard: u32 = 0,
     cursor_device: u32 = 0,
+    /// wl_data_device_manager and the seat's data device; both 0 without the
+    /// global (or without a seat), which makes the clipboard unsupported. The
+    /// manager's version is the version of every object it creates.
+    data_device_manager: u32 = 0,
+    data_device_manager_version: u32 = 0,
+    data_device: u32 = 0,
 
     scaling: f32 = 1.0,
+
+    /// Serial of the last keyboard_enter, keyboard_key or pointer_button.
+    /// set_selection needs a serial the compositor issued to us, so a copy
+    /// before any input has nothing to offer. The receive task writes it,
+    /// `copy` reads it.
+    input_serial: std.atomic.Value(u32) = .init(0),
 
     // Input-mapping state touched only by the receive task.
     pointer_x: common.X = 0,
@@ -71,6 +83,20 @@ pub const WindowManager = struct {
     pointer_serial: u32 = 0,
     cursor_visible: bool = true,
     cursor_shape: proto.cursor_shape.Shape = .default,
+
+    // Clipboard — guarded by state_mutex.
+    /// Our wl_data_source while we own the selection; 0 otherwise.
+    data_source: u32 = 0,
+    /// The text `data_source` serves.
+    clipboard_text: ?[]u8 = null,
+    /// The compositor's current selection offer, and the one being announced:
+    /// data_offer_new opens it, data_offer_mime fills it, data_device_selection
+    /// commits it.
+    offer: ?Offer = null,
+    pending_offer: ?Offer = null,
+    /// Tasks writing our text into receivers' pipes; reaped as they finish,
+    /// canceled in deinit. Receive-task only.
+    send_tasks: std.ArrayList(*SendTask) = .empty,
 
     state_mutex: std.Io.Mutex = .init,
     window_objects: std.AutoHashMapUnmanaged(u32, *WindowShared) = .empty,
@@ -121,6 +147,18 @@ pub const WindowManager = struct {
         // Optional globals — every feature they back degrades gracefully.
         if (self.display.findGlobal("wl_seat")) |global| {
             self.seat = try self.display.bind(global, .seat, 5);
+        }
+        // The clipboard rides on the seat's data device; version 2 adds
+        // release, 3 the drag-and-drop actions we do not use.
+        if (self.display.findGlobal("wl_data_device_manager")) |global| {
+            if (self.seat != 0) {
+                self.data_device_manager_version = @min(3, global.version);
+                self.data_device_manager = try self.display.bind(global, .data_device_manager, self.data_device_manager_version);
+                self.data_device = try self.display.newId(.data_device);
+                const writer = self.display.acquire();
+                defer self.display.release();
+                try proto.data_device.manager.getDataDevice(writer, self.data_device_manager, self.data_device, self.seat);
+            }
         }
         if (self.display.findGlobal("zxdg_decoration_manager_v1")) |global| {
             self.decoration_manager = try self.display.bind(global, .decoration_manager, 1);
@@ -173,6 +211,9 @@ pub const WindowManager = struct {
 
     pub fn deinit(self: *@This()) void {
         self.stopRepeat();
+        self.reapSendTasks(.cancel);
+        self.send_tasks.deinit(self.allocator);
+        self.releaseClipboard();
         self.display.deinit();
         self.window_objects.deinit(self.allocator);
         self.redraw_callbacks.deinit(self.allocator);
@@ -415,6 +456,7 @@ pub const WindowManager = struct {
                 return .{ .mouse_moved = .{ .x = self.pointer_x, .y = self.pointer_y, .window_id = focus } };
             },
             .pointer_button => |button| {
+                self.input_serial.store(button.serial, .monotonic);
                 const focus = self.pointerFocus() orelse return null;
                 const mapped = buttonFromEvdev(button.button);
                 if (button.state == proto.wayland.state_pressed) {
@@ -437,6 +479,7 @@ pub const WindowManager = struct {
                 } };
             },
             .keyboard_enter => |enter| {
+                self.input_serial.store(enter.serial, .monotonic);
                 self.keyboard_focus = enter.surface;
                 return .{ .focus_in = enter.surface };
             },
@@ -479,6 +522,7 @@ pub const WindowManager = struct {
                 return null;
             },
             .keyboard_key => |key| {
+                self.input_serial.store(key.serial, .monotonic);
                 if (self.keyboard_focus == 0) return null;
                 // Wayland keyboard codes are raw evdev codes; the scancode
                 // stays positional while the Key follows the active layout
@@ -513,6 +557,51 @@ pub const WindowManager = struct {
                     .modifiers = self.modifiers,
                     .window_id = self.keyboard_focus,
                 } };
+            },
+            .data_offer_new => |new| {
+                self.state_mutex.lockUncancelable(io);
+                defer self.state_mutex.unlock(io);
+                // An announcement nothing committed (a drag that passed
+                // through, say) would otherwise sit in the compositor forever.
+                if (self.pending_offer) |stale| self.destroyOfferLocked(stale);
+                self.pending_offer = .{ .id = new.offer };
+                return null;
+            },
+            .data_offer_mime => |mime| {
+                self.state_mutex.lockUncancelable(io);
+                defer self.state_mutex.unlock(io);
+                if (self.pending_offer) |*pending| {
+                    if (pending.id == mime.offer) pending.noteMime(mime.mime);
+                }
+                return null;
+            },
+            .data_device_selection => |selection| {
+                self.state_mutex.lockUncancelable(io);
+                defer self.state_mutex.unlock(io);
+                if (self.offer) |old| self.destroyOfferLocked(old);
+                self.offer = null;
+                if (selection.offer == 0) return null;
+                if (self.pending_offer) |pending| {
+                    if (pending.id == selection.offer) {
+                        self.offer = pending;
+                        self.pending_offer = null;
+                        return null;
+                    }
+                }
+                // Named without an announcement: track the id, but with no
+                // mime type known a paste reports it empty.
+                self.offer = .{ .id = selection.offer };
+                return null;
+            },
+            .data_source_send => |send| {
+                self.serveSend(io, send);
+                return null;
+            },
+            .data_source_cancelled => |source| {
+                self.state_mutex.lockUncancelable(io);
+                defer self.state_mutex.unlock(io);
+                if (self.data_source == source) self.dropSourceLocked();
+                return null;
             },
             else => return null,
         }
@@ -721,7 +810,248 @@ pub const WindowManager = struct {
         slot.shm.deinit();
         self.allocator.destroy(slot);
     }
+
+    /// Store `text` as a new data source and make it the seat's selection;
+    /// the receive task serves it to whoever asks, until the compositor says
+    /// the source was replaced (`data_source_cancelled`). A copy that does
+    /// not answer an input event may not take, and nothing reports that; a
+    /// copy from a key or button handler always does.
+    pub fn copy(self: *@This(), text: []const u8) !void {
+        if (self.data_device == 0) return error.ClipboardUnsupported;
+        // The compositor ignores a set_selection whose serial is older than
+        // the current selection's, and there is no serial at all before the
+        // first input event.
+        const serial = self.input_serial.load(.monotonic);
+        if (serial == 0) return error.ClipboardUnsupported;
+
+        const copied = try self.allocator.dupe(u8, text);
+        const source = blk: {
+            errdefer self.allocator.free(copied);
+            break :blk try self.display.newId(.data_source);
+        };
+
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        if (self.clipboard_text) |old| self.allocator.free(old);
+        self.clipboard_text = copied;
+        const old_source = self.data_source;
+        self.data_source = source;
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            // The compositor may still send cancelled for the old id; the
+            // handler ignores anything but the current source.
+            if (old_source != 0) try proto.data_device.source.destroy(writer, old_source);
+            try proto.data_device.manager.createDataSource(writer, self.data_device_manager, source);
+            for (proto.data_device.text_mime_types) |mime| {
+                try proto.data_device.source.offer(writer, source, mime);
+            }
+            try proto.data_device.device.setSelection(writer, self.data_device, source, serial);
+        }
+        try self.display.flush();
+    }
+
+    /// The selection's text as UTF-8, owned by the caller: ask the current
+    /// offer to write it into a pipe and read that until the source closes
+    /// it, giving up after `paste_idle_ms` without data. Our own text takes
+    /// the same route.
+    pub fn paste(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        if (self.data_device == 0) return error.ClipboardUnsupported;
+
+        // No short-circuit to our own text: the compositor drops a
+        // set_selection with a stale serial without a word, so `data_source`
+        // being set does not prove we own the clipboard; the offer the
+        // compositor announced does. Our own selection comes back through
+        // our own send task, which is cheap.
+        const Target = struct { id: u32, mime: []const u8 };
+        const target: Target = blk: {
+            self.state_mutex.lockUncancelable(self.io);
+            defer self.state_mutex.unlock(self.io);
+            const offer = self.offer orelse return error.ClipboardEmpty;
+            const mime = offer.mime orelse return error.ClipboardEmpty;
+            break :blk .{ .id = offer.id, .mime = proto.data_device.text_mime_types[mime] };
+        };
+
+        var pipe: [2]i32 = undefined;
+        switch (std.os.linux.errno(std.os.linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
+            .SUCCESS => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+        const read_end = pipe[0];
+        defer _ = std.os.linux.close(read_end);
+        {
+            // The compositor forwards its copy of the write end to the source
+            // client; ours must go, or the pipe never reports end of file.
+            var buffer: [64]u8 = undefined;
+            const message = try proto.data_device.offer.receiveMessage(&buffer, target.id, target.mime);
+            const sent = self.display.sendWithFd(message, pipe[1]);
+            _ = std.os.linux.close(pipe[1]);
+            try sent;
+        }
+
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            var fds = [1]std.posix.pollfd{.{ .fd = read_end, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&fds, paste_idle_ms) == 0) return error.ClipboardTimeout;
+            const count = std.posix.read(read_end, &chunk) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (count == 0) break;
+            try text.appendSlice(allocator, chunk[0..count]);
+        }
+        return text.toOwnedSlice(allocator);
+    }
+
+    /// A receiver asked our source for its text: hand the fd and a copy to a
+    /// task that writes and closes it. Receive-task only; a task rather than
+    /// an inline write because a pipe holds 64 KiB and a slow receiver would
+    /// otherwise hold up every event.
+    fn serveSend(self: *@This(), io: std.Io, send: @FieldType(wl.Event, "data_source_send")) void {
+        const text: ?[]u8 = blk: {
+            self.state_mutex.lockUncancelable(io);
+            defer self.state_mutex.unlock(io);
+            if (send.source != self.data_source) break :blk null;
+            break :blk self.allocator.dupe(u8, self.clipboard_text orelse "") catch null;
+        };
+        const bytes = text orelse {
+            _ = std.os.linux.close(send.fd);
+            return;
+        };
+
+        self.reapSendTasks(.finished);
+        const task = self.allocator.create(SendTask) catch {
+            _ = std.os.linux.close(send.fd);
+            self.allocator.free(bytes);
+            return;
+        };
+        task.* = .{ .fd = send.fd, .text = bytes };
+        task.future = io.concurrent(SendTask.run, .{ task, io, self.allocator }) catch |err| {
+            log.debug("Clipboard send task unavailable ({any}); writing inline", .{err});
+            SendTask.run(task, io, self.allocator);
+            self.allocator.destroy(task);
+            return;
+        };
+        self.send_tasks.append(self.allocator, task) catch {
+            task.future.?.await(io);
+            self.allocator.destroy(task);
+        };
+    }
+
+    /// Retire send tasks: the finished ones, or all of them (canceling the
+    /// rest) at deinit. Receive-task only.
+    fn reapSendTasks(self: *@This(), which: enum { finished, cancel }) void {
+        var index = self.send_tasks.items.len;
+        while (index > 0) {
+            index -= 1;
+            const task = self.send_tasks.items[index];
+            switch (which) {
+                .finished => if (!task.done.load(.acquire)) continue,
+                .cancel => {},
+            }
+            if (task.future) |*future| {
+                switch (which) {
+                    .finished => future.await(self.io),
+                    .cancel => future.cancel(self.io),
+                }
+            }
+            _ = self.send_tasks.swapRemove(index);
+            self.allocator.destroy(task);
+        }
+    }
+
+    /// Requires state_mutex. Destroy our source and forget its text.
+    fn dropSourceLocked(self: *@This()) void {
+        if (self.data_source != 0) {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            proto.data_device.source.destroy(writer, self.data_source) catch {};
+        }
+        self.data_source = 0;
+        if (self.clipboard_text) |text| self.allocator.free(text);
+        self.clipboard_text = null;
+    }
+
+    /// Requires state_mutex. Offers are server-created, so the map entry
+    /// goes with the destroy request rather than waiting for a delete_id
+    /// that never comes.
+    fn destroyOfferLocked(self: *@This(), offer: Offer) void {
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            proto.data_device.offer.destroy(writer, offer.id) catch {};
+        }
+        self.display.forgetServerObject(offer.id);
+    }
+
+    /// Give every clipboard object back before the connection closes.
+    fn releaseClipboard(self: *@This()) void {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        if (self.offer) |offer| self.destroyOfferLocked(offer);
+        self.offer = null;
+        if (self.pending_offer) |offer| self.destroyOfferLocked(offer);
+        self.pending_offer = null;
+        self.dropSourceLocked();
+        if (self.data_device != 0 and self.data_device_manager_version >= 2) {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            proto.data_device.device.release(writer, self.data_device) catch {};
+        }
+        self.display.flush() catch {};
+    }
 };
+
+/// How long a paste waits for the source to write more before giving up.
+const paste_idle_ms: i32 = 1000;
+
+/// A selection offer the compositor announced: its server-created id and the
+/// best text mime type it carries, as an index into `text_mime_types`.
+const Offer = struct {
+    id: u32,
+    mime: ?usize = null,
+
+    fn noteMime(self: *@This(), name: []const u8) void {
+        for (proto.data_device.text_mime_types, 0..) |candidate, index| {
+            if (!std.mem.eql(u8, candidate, name)) continue;
+            if (self.mime == null or index < self.mime.?) self.mime = index;
+            return;
+        }
+    }
+};
+
+/// One receiver's copy of our clipboard text on its way into a pipe.
+const SendTask = struct {
+    fd: std.posix.fd_t,
+    text: []u8,
+    future: ?std.Io.Future(void) = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(task: *SendTask, io: std.Io, allocator: std.mem.Allocator) void {
+        defer task.done.store(true, .release);
+        defer allocator.free(task.text);
+        // The compositor hands over a plain blocking pipe end.
+        const file = std.Io.File{ .handle = task.fd, .flags = .{ .nonblocking = false } };
+        defer file.close(io);
+        // A receiver that went away first makes this a broken pipe; the
+        // runtime ignores SIGPIPE, so it is only an error here.
+        file.writeStreamingAll(io, task.text) catch |err| log.debug("Clipboard send failed: {any}", .{err});
+    }
+};
+
+test "Offer keeps the best text mime type it is told about" {
+    var offer = Offer{ .id = 0xff000001 };
+    offer.noteMime("image/png");
+    try testing.expectEqual(@as(?usize, null), offer.mime);
+    offer.noteMime("STRING");
+    try testing.expectEqual(@as(?usize, 4), offer.mime);
+    offer.noteMime("text/plain;charset=utf-8");
+    try testing.expectEqual(@as(?usize, 0), offer.mime);
+    offer.noteMime("text/plain");
+    try testing.expectEqual(@as(?usize, 0), offer.mime);
+}
 
 /// A key being auto-repeated: what the original press reported, re-emitted
 /// with `repeat = true` on every tick.
@@ -963,6 +1293,18 @@ pub const Window = struct {
             _ = try wm.step(wm.io);
         }
         try self.present();
+    }
+
+    /// Put `text` on the system clipboard; see `WindowManager.copy`. Needs
+    /// an input event to have reached this connection first.
+    pub fn setClipboardText(self: *@This(), text: []const u8) !void {
+        return self.wm.copy(text);
+    }
+
+    /// The clipboard's text as UTF-8, owned by the caller; see
+    /// `WindowManager.paste`.
+    pub fn getClipboardText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        return self.wm.paste(allocator);
     }
 
     pub fn toggleFullscreen(self: *@This()) void {
@@ -1498,6 +1840,16 @@ test "blitScaled scales 1x1 source across the target box" {
     blitScaled(&shadow, 4, 4, &src, 1, 1, .{ .width = 4, .height = 4 });
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, shadow[0..4].*);
     try testing.expectEqual([4]u8{ 0, 0, 255, 255 }, shadow[60..64].*);
+}
+
+// Nothing in the test build calls the clipboard path; take the addresses so it is analyzed.
+test "clipboard entry points compile" {
+    _ = &WindowManager.copy;
+    _ = &WindowManager.paste;
+    _ = &WindowManager.receiveIo;
+    _ = &WindowManager.deinit;
+    _ = &Window.setClipboardText;
+    _ = &Window.getClipboardText;
 }
 
 const std = @import("std");

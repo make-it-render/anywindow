@@ -62,6 +62,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         verify_mod.addImport("anywindow", any);
+        // The clipboard check plays a silent X11 selection owner from a bare connection.
+        verify_mod.addImport("x11", x11);
         const verify = b.addExecutable(.{
             .name = "verify",
             .root_module = verify_mod,

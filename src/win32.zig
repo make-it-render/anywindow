@@ -276,6 +276,47 @@ pub const Window = struct {
     /// No frame callback wired up on Windows; nothing to arm.
     pub fn requestFrame(_: *@This()) void {}
 
+    /// Put `text` on the system clipboard as CF_UNICODETEXT, with this window as the owner.
+    /// Line endings become CRLF, the Windows text convention (SDL does the same).
+    pub fn setClipboardText(self: *@This(), text: []const u8) !void {
+        const units = try clipboardUnitsFromUtf8(self.wm.allocator, text);
+        defer self.wm.allocator.free(units);
+
+        try openClipboard(self.wm.io, self.handle);
+        defer _ = win.CloseClipboard();
+        if (win.EmptyClipboard() == 0) return error.ClipboardUnsupported;
+
+        // The terminating NUL travels with the text.
+        const bytes = (units.len + 1) * @sizeOf(u16);
+        const block = win.GlobalAlloc(win.GMEM_MOVEABLE, bytes) orelse return error.OutOfMemory;
+        {
+            const memory = win.GlobalLock(block) orelse {
+                _ = win.GlobalFree(block);
+                return error.ClipboardUnsupported;
+            };
+            @memcpy(memory[0..bytes], std.mem.sliceAsBytes(units[0 .. units.len + 1]));
+            _ = win.GlobalUnlock(block);
+        }
+        // On success the system owns the block; on failure it is still ours to free.
+        if (win.SetClipboardData(win.CF_UNICODETEXT, block) == null) {
+            _ = win.GlobalFree(block);
+            return error.ClipboardUnsupported;
+        }
+    }
+
+    /// The clipboard's text as UTF-8, owned by the caller, with CRLF folded back to LF.
+    pub fn getClipboardText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        try openClipboard(self.wm.io, self.handle);
+        defer _ = win.CloseClipboard();
+        if (win.IsClipboardFormatAvailable(win.CF_UNICODETEXT) == 0) return error.ClipboardEmpty;
+        const block = win.GetClipboardData(win.CF_UNICODETEXT) orelse return error.ClipboardEmpty;
+        const memory = win.GlobalLock(block) orelse return error.ClipboardEmpty;
+        defer _ = win.GlobalUnlock(block);
+        const size = win.GlobalSize(block);
+        const units: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, memory[0 .. size - size % 2]));
+        return utf8FromClipboardUnits(allocator, units);
+    }
+
     pub fn beginDraw(self: *@This()) !void {
         const window_dc = win.GetDC(self.handle);
         self.window_dc = window_dc;
@@ -890,6 +931,66 @@ fn pushCharacter(window_id: common.WindowID, codepoint: u21) void {
     } });
 }
 
+/// Another process may hold the clipboard open for a moment; retry briefly before giving up.
+fn openClipboard(io: std.Io, owner: ?win.WindowHandle) !void {
+    for (0..clipboard_open_attempts) |_| {
+        if (win.OpenClipboard(owner) != 0) return;
+        io.sleep(clipboard_open_retry, .awake) catch return error.ClipboardUnsupported;
+    }
+    return error.ClipboardUnsupported;
+}
+
+const clipboard_open_attempts = 10;
+const clipboard_open_retry = std.Io.Duration.fromMilliseconds(10);
+
+/// UTF-8 to the NUL-terminated UTF-16 CF_UNICODETEXT wants, with every bare LF turned into
+/// CRLF on the way.
+fn clipboardUnitsFromUtf8(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
+    var crlf: std.ArrayList(u8) = .empty;
+    defer crlf.deinit(allocator);
+    try crlf.ensureTotalCapacity(allocator, text.len + 1);
+    var previous: u8 = 0;
+    for (text) |byte| {
+        if (byte == '\n' and previous != '\r') try crlf.append(allocator, '\r');
+        try crlf.append(allocator, byte);
+        previous = byte;
+    }
+    return std.unicode.utf8ToUtf16LeAllocZ(allocator, crlf.items) catch |err| switch (err) {
+        error.InvalidUtf8 => return error.ClipboardUnsupported,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// CF_UNICODETEXT (up to its NUL) to UTF-8, with CRLF folded back to LF.
+fn utf8FromClipboardUnits(allocator: std.mem.Allocator, units: []const u16) ![]u8 {
+    const terminated = std.mem.sliceTo(units, 0);
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(allocator, terminated) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ClipboardUnsupported,
+    };
+    // Fold in place: the result only ever shrinks.
+    var write: usize = 0;
+    for (utf8, 0..) |byte, read| {
+        if (byte == '\r' and read + 1 < utf8.len and utf8[read + 1] == '\n') continue;
+        utf8[write] = byte;
+        write += 1;
+    }
+    if (write == utf8.len) return utf8;
+    return allocator.realloc(utf8, write) catch utf8[0..write];
+}
+
+test "clipboard text goes out as CRLF UTF-16 and comes back as LF UTF-8" {
+    const units = try clipboardUnitsFromUtf8(testing.allocator, "a\nb\r\nc é");
+    defer testing.allocator.free(units);
+    const expected = std.unicode.utf8ToUtf16LeStringLiteral("a\r\nb\r\nc é");
+    try testing.expectEqualSlices(u16, expected, units);
+
+    const with_nul = [_]u16{ 'x', '\r', '\n', 'y', 0, 'z' };
+    const back = try utf8FromClipboardUnits(testing.allocator, &with_nul);
+    defer testing.allocator.free(back);
+    try testing.expectEqualStrings("x\ny", back);
+}
+
 /// RGB to ABGR
 fn commonPixelToWinPixel(src: [3]u8) u32 {
     const dst: [4]u8 = [4]u8{ 0, src[2], src[1], src[0] };
@@ -907,7 +1008,18 @@ fn getWindowsModifiers() common.Modifiers {
     };
 }
 
+// Nothing in the test build calls the clipboard methods; take their addresses on Windows so
+// they are analyzed (on other targets that would drag in user32 at link time).
+test "clipboard entry points compile" {
+    if (builtin.os.tag == .windows) {
+        _ = &Window.setClipboardText;
+        _ = &Window.getClipboardText;
+    }
+}
+
 const std = @import("std");
+const builtin = @import("builtin");
+const testing = std.testing;
 const win = @import("windows");
 const common = @import("common.zig");
 const queue = @import("queue.zig");

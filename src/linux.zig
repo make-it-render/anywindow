@@ -158,6 +158,21 @@ pub const Window = union(enum) {
         }
     }
 
+    /// Put `text` on the system clipboard and serve it until another client copies.
+    pub fn setClipboardText(self: *@This(), text: []const u8) !void {
+        switch (self.*) {
+            inline else => |*window| return window.setClipboardText(text),
+        }
+    }
+
+    /// The clipboard's text as UTF-8, owned by the caller; waits for the owner at most one
+    /// second. Fails with a `common.ClipboardError`.
+    pub fn getClipboardText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        switch (self.*) {
+            inline else => |*window| return window.getClipboardText(allocator),
+        }
+    }
+
     pub fn beginDraw(self: *@This()) !void {
         switch (self.*) {
             inline else => |*window| return window.beginDraw(),

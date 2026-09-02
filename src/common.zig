@@ -49,6 +49,17 @@ pub const WindowStatus = enum {
     closed,
 };
 
+/// What `Window.getClipboardText` and `Window.setClipboardText` fail with.
+pub const ClipboardError = error{
+    /// Nothing, or nothing textual, is on the clipboard.
+    ClipboardEmpty,
+    /// The clipboard owner never answered.
+    ClipboardTimeout,
+    /// The backend cannot do this transfer: no clipboard on this connection, a text too large
+    /// for one X11 request, an X11 owner that insists on INCR, a Wayland copy before any input.
+    ClipboardUnsupported,
+};
+
 pub const Event = union(enum) {
     nop: void,
     close: WindowID,

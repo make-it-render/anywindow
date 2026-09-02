@@ -86,7 +86,244 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("frame pacing: unsupported on this backend\n", .{});
     }
 
+    // Last: it runs the reader on a task, and canceling that mid-message would
+    // confuse the synchronous pumps above.
+    try verifyClipboard(io, environ, allocator, &wm, &window);
+
     std.debug.print("verify: ok\n", .{});
+}
+
+/// The clipboard five ways: our text served to a foreign client (wl-paste or
+/// xclip), a self round trip through the server so the serving path runs end
+/// to end in one process, a foreign client's text pasted here, a copy made
+/// after that foreign claim, and (X11) an owner that never answers, which a
+/// paste must time out on. The reader runs on a task meanwhile, as it does
+/// under recvloop: the serving side lives there, and the main thread must be
+/// free to block in child processes and in the paste itself.
+fn verifyClipboard(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator, wm: *win.WindowManager, window: *win.Window) !void {
+    const tools: ClipboardTools = switch (wm.*) {
+        .wayland => .{ .paste = &.{ "wl-paste", "--no-newline" }, .copy = &.{"wl-copy"}, .copy_from_stdin = false },
+        .x11 => .{ .paste = &.{ "xclip", "-selection", "clipboard", "-o" }, .copy = &.{ "xclip", "-selection", "clipboard", "-i" }, .copy_from_stdin = true },
+    };
+
+    // A Wayland copy needs an input serial; the compositor hands one over
+    // with keyboard focus, which a fresh window normally gets. Give it a moment.
+    if (wm.* == .wayland) {
+        var polls: u32 = 0;
+        while (wm.wayland.input_serial.load(.monotonic) == 0 and polls < 50) : (polls += 1) {
+            _ = try pump(io, wm, window);
+            try io.sleep(std.Io.Duration.fromMilliseconds(20), .awake);
+        }
+        if (wm.wayland.input_serial.load(.monotonic) == 0) {
+            std.debug.print("clipboard: skipped (the window never got keyboard focus, so there is no input serial)\n", .{});
+            return;
+        }
+    }
+
+    var reader = try io.concurrent(readerLoop, .{ io, wm });
+    defer reader.cancel(io);
+
+    // 1. Served: our text, fetched by a foreign client.
+    const ours = try std.fmt.allocPrint(allocator, "mir clipboard {d}", .{nonce(io)});
+    defer allocator.free(ours);
+    try window.setClipboardText(ours);
+    {
+        const fetched = try runTool(io, allocator, tools.paste, null, true);
+        defer allocator.free(fetched);
+        if (!std.mem.eql(u8, fetched, ours)) {
+            std.debug.print("clipboard: foreign paste got \"{s}\", expected \"{s}\"\n", .{ fetched, ours });
+            return error.ClipboardServeMismatch;
+        }
+    }
+    std.debug.print("clipboard: served to {s}: ok\n", .{tools.paste[0]});
+
+    // 2. Self, through the server: a paste never short-circuits to our own
+    // text, so the reader task serves our own request here.
+    const again = try std.fmt.allocPrint(allocator, "mir round trip {d}", .{nonce(io)});
+    defer allocator.free(again);
+    try window.setClipboardText(again);
+    try expectPaste(io, allocator, window, again, "server round trip");
+    std.debug.print("clipboard: round trip through the server: ok\n", .{});
+
+    // 3. Foreign: a tool owns the selection, we paste it.
+    const theirs = try std.fmt.allocPrint(allocator, "from {s} {d}", .{ tools.copy[0], nonce(io) });
+    defer allocator.free(theirs);
+    if (tools.copy_from_stdin) {
+        allocator.free(try runTool(io, allocator, tools.copy, theirs, false));
+    } else {
+        const argv = [_][]const u8{ tools.copy[0], theirs };
+        allocator.free(try runTool(io, allocator, &argv, null, false));
+    }
+    try expectPaste(io, allocator, window, theirs, "foreign owner");
+    std.debug.print("clipboard: pasted from {s}: ok\n", .{tools.copy[0]});
+
+    // 4. A copy with no new input since the foreign claim. X11 claims with
+    // CurrentTime, so it must take. Wayland reuses the last input serial,
+    // which is now older than the selection's; whether the compositor still
+    // accepts it is its call, so that is reported rather than judged.
+    const probe = try std.fmt.allocPrint(allocator, "mir after foreign {d}", .{nonce(io)});
+    defer allocator.free(probe);
+    try window.setClipboardText(probe);
+    {
+        const fetched = try runTool(io, allocator, tools.paste, null, true);
+        defer allocator.free(fetched);
+        const taken = std.mem.eql(u8, fetched, probe);
+        switch (wm.*) {
+            .x11 => {
+                if (!taken) {
+                    std.debug.print("clipboard: CurrentTime claim after a foreign owner got \"{s}\", expected \"{s}\"\n", .{ fetched, probe });
+                    return error.ClipboardClaimDropped;
+                }
+                std.debug.print("clipboard: claim after a foreign owner: ok\n", .{});
+            },
+            .wayland => std.debug.print("clipboard: copy reusing an old serial after a foreign claim: {s} by the compositor\n", .{if (taken) "taken" else "dropped"}),
+        }
+    }
+
+    // 5. An owner that never answers (X11 only: a bare connection that claims
+    // CLIPBOARD and reads nothing). The paste must give up, and once the
+    // silent owner is gone the next paste must come back at once.
+    if (wm.* == .x11) {
+        const silent = try x11.connect(io, environ, .{});
+        var silent_open = true;
+        defer if (silent_open) silent.close(io);
+        const info = try x11.setup(io, environ, allocator, silent);
+        defer info.deinit();
+        var xid = x11.XID.init(info.resource_id_base, info.resource_id_mask);
+        const owner = try xid.genID();
+        const values = x11.proto.WindowValue{ .BackgroundPixel = 0 };
+        try x11.sendWithValues(io, silent, x11.proto.CreateWindow{
+            .window_id = owner,
+            .parent_id = info.screens[0].root,
+            .visual_id = info.screens[0].root_visual,
+            .depth = info.screens[0].root_depth,
+            .x = 0,
+            .y = 0,
+            .width = 1,
+            .height = 1,
+            .border_width = 0,
+            .window_class = .InputOutput,
+            .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
+        }, values);
+        const clipboard = try x11.internAtom(io, silent, "CLIPBOARD");
+        try x11.send(io, silent, x11.proto.SetSelectionOwner{ .owner = owner, .selection = clipboard });
+        // A reply-bearing request behind it proves the server has processed the claim.
+        _ = try x11.internAtom(io, silent, "CLIPBOARD");
+
+        const started = std.Io.Clock.now(.awake, io);
+        if (window.getClipboardText(allocator)) |text| {
+            allocator.free(text);
+            std.debug.print("clipboard: a silent owner answered?\n", .{});
+            return error.ClipboardTimeoutMissing;
+        } else |err| switch (err) {
+            error.ClipboardTimeout => {},
+            else => return err,
+        }
+        const waited_ms = @divTrunc(started.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds, std.time.ns_per_ms);
+        std.debug.print("clipboard: silent owner timed out after {d} ms: ok\n", .{waited_ms});
+
+        silent.close(io);
+        silent_open = false;
+        // The server drops the selection with the connection; a paste now is
+        // an immediate "nothing there".
+        if (window.getClipboardText(allocator)) |text| {
+            allocator.free(text);
+            std.debug.print("clipboard: got text with no owner?\n", .{});
+            return error.ClipboardNotEmpty;
+        } else |err| switch (err) {
+            error.ClipboardEmpty => {},
+            else => return err,
+        }
+        std.debug.print("clipboard: empty after the owner left: ok\n", .{});
+    }
+}
+
+const ClipboardTools = struct {
+    paste: []const []const u8,
+    copy: []const []const u8,
+    /// xclip takes the text on stdin; wl-copy takes it as an argument.
+    copy_from_stdin: bool,
+};
+
+/// Run a clipboard tool with `stdin_text` on its stdin (if any) and return
+/// its stdout when `capture` is set. The copy tools fork a daemon that keeps
+/// serving after the parent exits; waiting on the parent is enough, but the
+/// daemon inherits the parent's streams, so they get no pipe to hold open.
+fn runTool(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, stdin_text: ?[]const u8, capture: bool) ![]u8 {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = if (stdin_text != null) .pipe else .ignore,
+        .stdout = if (capture) .pipe else .ignore,
+        .stderr = .ignore,
+    });
+    errdefer child.kill(io);
+    if (stdin_text) |text| {
+        try child.stdin.?.writeStreamingAll(io, text);
+        child.stdin.?.close(io);
+        child.stdin = null;
+    }
+
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (capture) {
+        const count = child.stdout.?.readStreaming(io, &.{&chunk}) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        if (count == 0) break;
+        try output.appendSlice(allocator, chunk[0..count]);
+    }
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("clipboard: {s} exited with {d}\n", .{ argv[0], code });
+            return error.ClipboardToolFailed;
+        },
+        else => return error.ClipboardToolFailed,
+    }
+    return output.toOwnedSlice(allocator);
+}
+
+/// Paste until `expected` comes back. The server announces a changed
+/// selection asynchronously, so until then a paste is empty or still returns
+/// the previous owner's text.
+fn expectPaste(io: std.Io, allocator: std.mem.Allocator, window: *win.Window, expected: []const u8, what: []const u8) !void {
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        const pasted = window.getClipboardText(allocator) catch |err| switch (err) {
+            error.ClipboardEmpty => if (tries < paste_tries) {
+                try io.sleep(paste_retry, .awake);
+                continue;
+            } else return err,
+            else => return err,
+        };
+        defer allocator.free(pasted);
+        if (std.mem.eql(u8, pasted, expected)) return;
+        if (tries < paste_tries) {
+            try io.sleep(paste_retry, .awake);
+            continue;
+        }
+        std.debug.print("clipboard: {s} paste got \"{s}\", expected \"{s}\"\n", .{ what, pasted, expected });
+        return error.ClipboardPasteMismatch;
+    }
+}
+
+const paste_tries = 20;
+const paste_retry = std.Io.Duration.fromMilliseconds(50);
+
+/// A number unlikely to be on the clipboard already.
+fn nonce(io: std.Io) u32 {
+    const now = std.Io.Clock.now(.awake, io);
+    return @truncate(@as(u96, @bitCast(now.nanoseconds)));
+}
+
+/// The reader task's loop while the clipboard check owns the main thread.
+/// Events are dropped; the socket read is the cancelation point.
+fn readerLoop(io: std.Io, wm: *win.WindowManager) void {
+    while (true) {
+        _ = wm.receiveIo(io) catch return;
+    }
 }
 
 /// Prove the compositor's frame callback reaches us: ask for a frame, present,
@@ -197,4 +434,5 @@ fn printScale(window: *win.Window) void {
 }
 
 const std = @import("std");
+const x11 = @import("x11");
 const win = @import("anywindow");

@@ -34,6 +34,32 @@ pub const WindowManager = struct {
     /// press, handed back by the next `receiveIo`.
     held_message: ?x11.Message = null,
 
+    /// A second connection for selection traffic: the reader task answers requests and reads
+    /// paste replies here, so `conn` keeps its single writer and single reader. Null when the
+    /// connect failed, which makes the clipboard unsupported.
+    clipboard_conn: ?std.Io.net.Stream,
+    /// Requests sent on `clipboard_conn` so far; replies and errors there quote it. Reader task only.
+    clipboard_sequence: u16 = 0,
+
+    // Clipboard state, guarded by clipboard_mutex: callers and the reader task both touch it.
+    /// Text we serve while one of our windows owns CLIPBOARD; null once another client took it.
+    clipboard_text: ?[]u8 = null,
+    /// The window that claimed the selection; 0 while we do not own it.
+    clipboard_owner: u32 = 0,
+    /// The paste in flight; see `paste`. The reader task matches a SelectionNotify against the
+    /// requestor, and delivers into the generation it matched, so a fetch started for a paste
+    /// that timed out meanwhile is dropped instead of being taken for the next one.
+    paste_pending: bool = false,
+    paste_generation: u32 = 0,
+    paste_requestor: u32 = 0,
+    paste_result: ?[]u8 = null,
+    paste_error: ?common.ClipboardError = null,
+    clipboard_mutex: std.Io.Mutex = .init,
+    /// One paste at a time; held for the whole of `paste`.
+    paste_mutex: std.Io.Mutex = .init,
+    /// Set by the reader task once paste_result or paste_error is filled.
+    paste_ready: std.Io.Event = .unset,
+
     keysym_map: []u32,
     keysyms_per_keycode: u8,
     min_keycode: u8,
@@ -57,7 +83,16 @@ pub const WindowManager = struct {
             .net_wm_state = try x11.internAtom(io, conn, "_NET_WM_STATE"),
             .net_wm_state_fullscreen = try x11.internAtom(io, conn, "_NET_WM_STATE_FULLSCREEN"),
             .net_wm_icon = try x11.internAtom(io, conn, "_NET_WM_ICON"),
+            .clipboard = try x11.internAtom(io, conn, "CLIPBOARD"),
+            .utf8_string = try x11.internAtom(io, conn, "UTF8_STRING"),
+            .targets = try x11.internAtom(io, conn, "TARGETS"),
+            .text = try x11.internAtom(io, conn, "TEXT"),
+            .incr = try x11.internAtom(io, conn, "INCR"),
+            .mir_clipboard = try x11.internAtom(io, conn, "MIR_CLIPBOARD"),
         };
+
+        const clipboard_conn = openClipboardConnection(io, environ, allocator);
+        errdefer if (clipboard_conn) |clipboard| clipboard.close(io);
 
         // Negotiate MIT-SHM while replies are still safe to read naively — once the event loop
         // starts, its reader task owns the connection and would swallow any reply we waited for.
@@ -145,6 +180,7 @@ pub const WindowManager = struct {
             .net_writer = net_writer,
 
             .shm = shm_extension,
+            .clipboard_conn = clipboard_conn,
 
             .scaling = scaling,
 
@@ -174,6 +210,9 @@ pub const WindowManager = struct {
 
         self.allocator.free(self.keysym_map);
         self.in_flight.deinit(self.allocator);
+        if (self.clipboard_text) |text| self.allocator.free(text);
+        if (self.paste_result) |text| self.allocator.free(text);
+        if (self.clipboard_conn) |clipboard| clipboard.close(self.io);
         self.conn.close(self.io);
         self.info.deinit();
         self.allocator.free(self.net_writer_buffer);
@@ -218,6 +257,25 @@ pub const WindowManager = struct {
             const message = self.takeHeldMessage() orelse (try x11.receive(io, self.conn, .none) orelse continue);
             const event = switch (message) {
                 .KeyRelease => |release| try self.mapKeyRelease(io, release),
+                // Selection traffic is answered here and never surfaces as an event.
+                .SelectionRequest => |request| blk: {
+                    self.serveSelection(io, request) catch |err| log.warn("Failed to serve a selection request: {any}", .{err});
+                    break :blk common.Event{ .nop = {} };
+                },
+                .SelectionClear => |clear| blk: {
+                    if (clear.selection == self.atoms.clipboard) self.dropClipboard(io, clear.owner);
+                    break :blk common.Event{ .nop = {} };
+                },
+                .SelectionNotify => |notify| blk: {
+                    self.finishPaste(io, notify);
+                    break :blk common.Event{ .nop = {} };
+                },
+                // Nothing waits for replies on this connection once the loop owns it (GrabPointer's
+                // is the one that arrives); drain the trailing data so the stream stays aligned.
+                .Reply => |reply| blk: {
+                    try skipBytes(io, self.conn, reply.extraLength());
+                    break :blk common.Event{ .nop = {} };
+                },
                 else => self.mapMessage(message),
             };
             switch (event) {
@@ -434,7 +492,341 @@ pub const WindowManager = struct {
         if (sym == 0 and col == 1) return self.keysym_map[base];
         return sym;
     }
+
+    /// The most text a single ChangeProperty can carry on this server, capped at
+    /// `max_clipboard_bytes`. Larger transfers need INCR, which is not implemented.
+    fn maxClipboardBytes(self: *const @This()) usize {
+        const request_limit = @as(usize, self.info.maximum_request_length) * 4;
+        return @min(max_clipboard_bytes, (request_limit -| @sizeOf(x11.proto.ChangeProperty)) & ~@as(usize, 3));
+    }
+
+    /// Store `text` and claim CLIPBOARD for `owner`; the reader task serves it to other clients
+    /// from then on, until a SelectionClear says somebody else copied.
+    pub fn copy(self: *@This(), owner: u32, text: []const u8) !void {
+        if (self.clipboard_conn == null) return error.ClipboardUnsupported;
+        if (text.len > self.maxClipboardBytes()) return error.ClipboardUnsupported;
+
+        const copied = try self.allocator.dupe(u8, text);
+        {
+            self.clipboard_mutex.lockUncancelable(self.io);
+            defer self.clipboard_mutex.unlock(self.io);
+            if (self.clipboard_text) |old| self.allocator.free(old);
+            self.clipboard_text = copied;
+            self.clipboard_owner = owner;
+        }
+
+        // CurrentTime, as SDL and GLFW do. ICCCM prefers the triggering event's time, but the
+        // server ignores a claim older than the current owner's without saying so, and a copy
+        // that is not answering an input event would then leave us believing we own a selection
+        // we do not. CurrentTime always takes.
+        try x11.send(self.io, self.conn, x11.proto.SetSelectionOwner{
+            .owner = owner,
+            .selection = self.atoms.clipboard,
+        });
+    }
+
+    /// Forget the text we were serving. `owner` limits it to a loss by that window: a
+    /// SelectionClear for a window that already gave the selection up, or a window being
+    /// destroyed while another one owns it, must not drop the live text.
+    fn dropClipboard(self: *@This(), io: std.Io, owner: u32) void {
+        self.clipboard_mutex.lockUncancelable(io);
+        defer self.clipboard_mutex.unlock(io);
+        if (self.clipboard_owner != owner) return;
+        if (self.clipboard_text) |text| self.allocator.free(text);
+        self.clipboard_text = null;
+        self.clipboard_owner = 0;
+    }
+
+    /// The clipboard's text as UTF-8, owned by the caller. Asks the owner to convert CLIPBOARD
+    /// into a property on `requestor` and waits for the reader task to fetch it, at most
+    /// `paste_timeout`. Our own text takes the same route.
+    pub fn paste(self: *@This(), allocator: std.mem.Allocator, requestor: u32) ![]u8 {
+        if (self.clipboard_conn == null) return error.ClipboardUnsupported;
+
+        self.paste_mutex.lockUncancelable(self.io);
+        defer self.paste_mutex.unlock(self.io);
+
+        // No short-circuit to our own text: the server reports a lost selection with a
+        // SelectionClear the reader task may not have seen yet, so `clipboard_owner` lags the
+        // truth by a moment. Asking the server costs one round trip through our own serving path.
+        // UTF8_STRING first; owners from before it refuse, and are asked for STRING instead.
+        return self.convertSelection(allocator, requestor, self.atoms.utf8_string) catch |err| switch (err) {
+            error.ClipboardEmpty => self.convertSelection(allocator, requestor, self.atoms.string),
+            else => err,
+        };
+    }
+
+    /// One ConvertSelection round trip; see `paste`.
+    fn convertSelection(self: *@This(), allocator: std.mem.Allocator, requestor: u32, target: u32) ![]u8 {
+        {
+            self.clipboard_mutex.lockUncancelable(self.io);
+            defer self.clipboard_mutex.unlock(self.io);
+            if (self.paste_result) |old| self.allocator.free(old);
+            self.paste_result = null;
+            self.paste_error = null;
+            self.paste_pending = true;
+            self.paste_generation +%= 1;
+            self.paste_requestor = requestor;
+            // No wait is pending: paste_mutex serialized the previous one to completion.
+            self.paste_ready.reset();
+        }
+
+        // CurrentTime again: an owner may refuse a request timed before its claim, and a stale
+        // input time would be.
+        try x11.send(self.io, self.conn, x11.proto.ConvertSelection{
+            .requestor = requestor,
+            .selection = self.atoms.clipboard,
+            .target = target,
+            .property = self.atoms.mir_clipboard,
+        });
+
+        self.paste_ready.waitTimeout(self.io, paste_timeout) catch |err| switch (err) {
+            error.Timeout => {
+                self.clipboard_mutex.lockUncancelable(self.io);
+                defer self.clipboard_mutex.unlock(self.io);
+                self.paste_pending = false;
+                return error.ClipboardTimeout;
+            },
+            error.Canceled => return err,
+        };
+
+        self.clipboard_mutex.lockUncancelable(self.io);
+        defer self.clipboard_mutex.unlock(self.io);
+        if (self.paste_error) |failure| return failure;
+        const text = self.paste_result orelse return error.ClipboardEmpty;
+        defer {
+            self.allocator.free(text);
+            self.paste_result = null;
+        }
+        return allocator.dupe(u8, text);
+    }
+
+    /// Send a request on `clipboard_conn` and return the sequence number its reply or error
+    /// will quote. Reader task only.
+    fn sendClipboard(self: *@This(), io: std.Io, request: anytype, extra_bytes: ?[]const u8) !u16 {
+        const conn = self.clipboard_conn orelse return error.ClipboardUnsupported;
+        if (extra_bytes) |bytes| {
+            try x11.sendWithBytes(io, conn, request, bytes);
+        } else {
+            try x11.send(io, conn, request);
+        }
+        self.clipboard_sequence +%= 1;
+        return self.clipboard_sequence;
+    }
+
+    /// Answer a client's request for our CLIPBOARD contents. Runs on the reader task; the
+    /// property write and the notify go out on `clipboard_conn`, since the requestor's window
+    /// belongs to another client and any connection may write to it.
+    fn serveSelection(self: *@This(), io: std.Io, request: x11.proto.SelectionRequest) !void {
+        // A copy, so the lock is not held while writing to the socket.
+        const served: ?[]u8 = blk: {
+            self.clipboard_mutex.lockUncancelable(io);
+            defer self.clipboard_mutex.unlock(io);
+            if (self.clipboard_owner == 0 or request.selection != self.atoms.clipboard) break :blk null;
+            break :blk try self.allocator.dupe(u8, self.clipboard_text orelse "");
+        };
+        defer if (served) |text| self.allocator.free(text);
+
+        // Pre-ICCCM requestors pass no property; the target names it then.
+        var property: u32 = if (request.property != 0) request.property else request.target;
+        const atoms = self.atoms;
+        if (served) |text| {
+            if (request.target == atoms.targets) {
+                // The text types only; TIMESTAMP and MULTIPLE are left out, as SDL leaves them.
+                const list = [_]u32{ atoms.targets, atoms.utf8_string, atoms.text, atoms.string };
+                _ = try self.sendClipboard(io, x11.proto.ChangeProperty{
+                    .window_id = request.requestor,
+                    .property = property,
+                    .property_type = atoms.atom,
+                    .format = 32,
+                    .length_of_data = list.len,
+                }, std.mem.sliceAsBytes(&list));
+            } else if (request.target == atoms.utf8_string or request.target == atoms.text or request.target == atoms.string) {
+                // TEXT asks for whichever text type we like. STRING is Latin-1 by the book, but
+                // every toolkit answers it with the UTF-8 bytes, and so do we.
+                const property_type = if (request.target == atoms.text) atoms.utf8_string else request.target;
+                _ = try self.sendClipboard(io, x11.proto.ChangeProperty{
+                    .window_id = request.requestor,
+                    .property = property,
+                    .property_type = property_type,
+                    .format = 8,
+                    .length_of_data = @intCast(text.len),
+                }, text);
+            } else {
+                property = 0;
+            }
+        } else {
+            property = 0;
+        }
+
+        const notify = x11.proto.SelectionNotify{
+            .time = request.time,
+            .requestor = request.requestor,
+            .selection = request.selection,
+            .target = request.target,
+            .property = property,
+        };
+        _ = try self.sendClipboard(io, x11.proto.SendEvent{
+            .destination = request.requestor,
+            .event_mask = 0,
+            .event = std.mem.toBytes(notify),
+        }, null);
+    }
+
+    const PasteOutcome = union(enum) { text: []u8, failure: common.ClipboardError };
+
+    /// The owner answered a ConvertSelection: fetch the property it wrote and hand the text to
+    /// the waiting `paste`. Runs on the reader task.
+    fn finishPaste(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify) void {
+        const generation = blk: {
+            self.clipboard_mutex.lockUncancelable(io);
+            defer self.clipboard_mutex.unlock(io);
+            // Not the paste we are waiting for: one that already timed out, or somebody else's.
+            if (!self.paste_pending or notify.requestor != self.paste_requestor) return;
+            if (notify.property != 0 and notify.property != self.atoms.mir_clipboard) return;
+            break :blk self.paste_generation;
+        };
+        if (notify.property == 0) {
+            self.deliverPaste(io, generation, .{ .failure = error.ClipboardEmpty });
+            return;
+        }
+        const outcome = self.fetchPasteProperty(io, notify) catch |err| blk: {
+            log.warn("Failed to fetch the pasted property: {any}", .{err});
+            break :blk PasteOutcome{ .failure = error.ClipboardEmpty };
+        };
+        self.deliverPaste(io, generation, outcome);
+    }
+
+    /// GetProperty on `clipboard_conn`, the only connection a reply can be read on once the
+    /// loop owns `conn`. Deleting the property tells an INCR owner to start, which we then
+    /// ignore; every other owner just sees its property cleaned up.
+    fn fetchPasteProperty(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify) !PasteOutcome {
+        const conn = self.clipboard_conn orelse return error.ClipboardUnsupported;
+        const sequence = try self.sendClipboard(io, x11.proto.GetProperty{
+            .window_id = notify.requestor,
+            .property = notify.property,
+            .property_type = 0, // AnyPropertyType
+            .long_offset = 0,
+            .long_length = @intCast(self.maxClipboardBytes() / 4),
+            .delete = true,
+        }, null);
+        const reply = try self.readClipboardReply(io, sequence);
+        const header = reply.as(x11.proto.GetPropertyReply);
+
+        const extra = try self.allocator.alloc(u8, reply.extraLength());
+        defer self.allocator.free(extra);
+        try x11.receiveBytes(io, conn, extra);
+
+        if (header.property_type == self.atoms.incr) return .{ .failure = error.ClipboardUnsupported };
+        if (header.bytes_after != 0) return .{ .failure = error.ClipboardUnsupported };
+        if (header.property_type == 0 or header.format != 8) return .{ .failure = error.ClipboardEmpty };
+
+        const value = extra[0..@min(header.value_len, extra.len)];
+        const text = if (header.property_type == self.atoms.string)
+            try latin1ToUtf8(self.allocator, value)
+        else
+            try self.allocator.dupe(u8, value);
+        return .{ .text = text };
+    }
+
+    /// Read `clipboard_conn` until the reply to request `sequence`. Errors from earlier
+    /// requests (a requestor that vanished mid-transfer) sit in the socket until now, since
+    /// nothing reads this connection between pastes; they are logged and skipped.
+    fn readClipboardReply(self: *@This(), io: std.Io, sequence: u16) !x11.proto.Reply {
+        const conn = self.clipboard_conn orelse return error.ClipboardUnsupported;
+        while (true) {
+            const message = try x11.receive(io, conn, .none) orelse continue;
+            switch (message) {
+                .Reply => |reply| {
+                    if (reply.sequence_number == sequence) return reply;
+                    try skipBytes(io, conn, reply.extraLength());
+                },
+                .ErrorMessage => |failure| {
+                    if (failure.sequence_number == sequence) return error.RequestFailed;
+                    log.debug("Stale X11 error on the clipboard connection: {any}", .{failure.error_code});
+                },
+                // No windows on this connection, so no events are expected.
+                else => {},
+            }
+        }
+    }
+
+    fn deliverPaste(self: *@This(), io: std.Io, generation: u32, outcome: PasteOutcome) void {
+        self.clipboard_mutex.lockUncancelable(io);
+        defer self.clipboard_mutex.unlock(io);
+        if (!self.paste_pending or self.paste_generation != generation) {
+            // The caller gave up while we were fetching.
+            if (outcome == .text) self.allocator.free(outcome.text);
+            return;
+        }
+        switch (outcome) {
+            .text => |text| self.paste_result = text,
+            .failure => |failure| self.paste_error = failure,
+        }
+        self.paste_pending = false;
+        self.paste_ready.set(io);
+    }
 };
+
+/// How long a paste waits for the owner. The server answers an ownerless selection at once, so
+/// only an owner that is hung or gone runs this out.
+const paste_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
+
+/// The largest text a copy accepts; see `WindowManager.maxClipboardBytes`.
+const max_clipboard_bytes: usize = 256 * 1024;
+
+/// The reader task's own connection for selection traffic; see `WindowManager.clipboard_conn`.
+fn openClipboardConnection(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) ?std.Io.net.Stream {
+    const conn = x11.connect(io, environ, .{}) catch |err| {
+        log.warn("Clipboard connection failed ({any}); clipboard unsupported", .{err});
+        return null;
+    };
+    const info = x11.setup(io, environ, allocator, conn) catch |err| {
+        log.warn("Clipboard connection setup failed ({any}); clipboard unsupported", .{err});
+        conn.close(io);
+        return null;
+    };
+    info.deinit();
+    return conn;
+}
+
+/// Read and drop `count` bytes: the trailing data of a reply nobody decodes.
+fn skipBytes(io: std.Io, conn: std.Io.net.Stream, count: usize) !void {
+    var scratch: [256]u8 = undefined;
+    var left = count;
+    while (left > 0) {
+        const chunk = scratch[0..@min(left, scratch.len)];
+        try x11.receiveBytes(io, conn, chunk);
+        left -= chunk.len;
+    }
+}
+
+/// STRING properties are Latin-1: every byte one code point, the upper half two UTF-8 bytes.
+fn latin1ToUtf8(allocator: std.mem.Allocator, latin1: []const u8) ![]u8 {
+    var extra: usize = 0;
+    for (latin1) |byte| {
+        if (byte >= 0x80) extra += 1;
+    }
+    const utf8 = try allocator.alloc(u8, latin1.len + extra);
+    var index: usize = 0;
+    for (latin1) |byte| {
+        if (byte < 0x80) {
+            utf8[index] = byte;
+            index += 1;
+        } else {
+            utf8[index] = 0xC0 | (byte >> 6);
+            utf8[index + 1] = 0x80 | (byte & 0x3F);
+            index += 2;
+        }
+    }
+    return utf8;
+}
+
+test "latin1ToUtf8 keeps ASCII and expands the upper half" {
+    const utf8 = try latin1ToUtf8(testing.allocator, "caf\xE9 \xA9");
+    defer testing.allocator.free(utf8);
+    try testing.expectEqualStrings("café ©", utf8);
+}
 
 pub const Window = struct {
     window_id: u32,
@@ -535,9 +927,22 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        // The server drops a destroyed window's selection without a SelectionClear.
+        self.wm.dropClipboard(self.wm.io, self.window_id);
         x11.send(self.wm.io, self.wm.conn, x11.proto.DestroyWindow{ .window_id = self.window_id }) catch |err| {
             log.err("Error destroying window: {any}", .{err});
         };
+    }
+
+    /// Put `text` on the system clipboard, with this window as the selection owner.
+    pub fn setClipboardText(self: *@This(), text: []const u8) !void {
+        return self.wm.copy(self.window_id, text);
+    }
+
+    /// The clipboard's text as UTF-8, owned by the caller. Blocks until the owner answers, at
+    /// most one second.
+    pub fn getClipboardText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        return self.wm.paste(allocator, self.window_id);
     }
 
     pub fn close(self: *@This()) void {
@@ -1284,6 +1689,16 @@ fn x11ModsFromState(state: u16) common.Modifiers {
     };
 }
 
+// Nothing in the test build calls the clipboard path; take the addresses so it is analyzed.
+test "clipboard entry points compile" {
+    _ = &WindowManager.copy;
+    _ = &WindowManager.paste;
+    _ = &WindowManager.receiveIo;
+    _ = &Window.setClipboardText;
+    _ = &Window.getClipboardText;
+    _ = &Window.deinit;
+}
+
 const Atoms = struct {
     atom: u32,
     cardinal: u32,
@@ -1294,6 +1709,13 @@ const Atoms = struct {
     net_wm_state: u32,
     net_wm_state_fullscreen: u32,
     net_wm_icon: u32,
+    clipboard: u32,
+    utf8_string: u32,
+    targets: u32,
+    text: u32,
+    incr: u32,
+    /// Where paste results land on the requesting window.
+    mir_clipboard: u32,
 };
 
 const std = @import("std");
