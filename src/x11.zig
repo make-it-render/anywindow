@@ -40,12 +40,14 @@ pub const WindowManager = struct {
     clipboard_conn: ?std.Io.net.Stream,
     /// Requests sent on `clipboard_conn` so far; replies and errors there quote it. Reader task only.
     clipboard_sequence: u16 = 0,
+    /// XFixes, for the owner-change events behind `Event.clipboard_changed`. Null when the
+    /// server lacks it, in which case the event is never sent.
+    xfixes: ?x11.Extension,
 
-    // Clipboard state, guarded by clipboard_mutex: callers and the reader task both touch it.
-    /// Text we serve while one of our windows owns CLIPBOARD; null once another client took it.
-    clipboard_text: ?[]u8 = null,
-    /// The window that claimed the selection; 0 while we do not own it.
-    clipboard_owner: u32 = 0,
+    // Selection state, guarded by clipboard_mutex: callers and the reader task both touch it.
+    /// CLIPBOARD and PRIMARY, indexed by `common.Selection`: the text we serve while one of our
+    /// windows owns each, and that window.
+    selections: [selection_count]OwnedSelection,
     /// The paste in flight; see `paste`. The reader task matches a SelectionNotify against the
     /// requestor, and delivers into the generation it matched, so a fetch started for a paste
     /// that timed out meanwhile is dropped instead of being taken for the next one.
@@ -54,11 +56,20 @@ pub const WindowManager = struct {
     paste_requestor: u32 = 0,
     paste_result: ?[]u8 = null,
     paste_error: ?common.ClipboardError = null,
+    /// Bumped by the reader task for every INCR chunk received, so a paste that is still
+    /// making progress can outlive `paste_timeout`.
+    paste_progress: u32 = 0,
     clipboard_mutex: std.Io.Mutex = .init,
     /// One paste at a time; held for the whole of `paste`.
     paste_mutex: std.Io.Mutex = .init,
     /// Set by the reader task once paste_result or paste_error is filled.
     paste_ready: std.Io.Event = .unset,
+    /// An INCR transfer we are receiving: the owner appends chunks to the paste property one
+    /// PropertyNotify at a time. Reader task only.
+    incr_paste: ?IncrPaste = null,
+    /// INCR transfers we are sending, each on a connection of its own; reaped as they finish,
+    /// canceled in deinit. Reader task only.
+    incr_sends: std.ArrayList(*IncrSend) = .empty,
 
     keysym_map: []u32,
     keysyms_per_keycode: u8,
@@ -93,6 +104,7 @@ pub const WindowManager = struct {
             .net_wm_state_fullscreen = try x11.internAtom(io, conn, "_NET_WM_STATE_FULLSCREEN"),
             .net_wm_icon = try x11.internAtom(io, conn, "_NET_WM_ICON"),
             .clipboard = try x11.internAtom(io, conn, "CLIPBOARD"),
+            .primary = try x11.internAtom(io, conn, "PRIMARY"),
             .utf8_string = try x11.internAtom(io, conn, "UTF8_STRING"),
             .targets = try x11.internAtom(io, conn, "TARGETS"),
             .text = try x11.internAtom(io, conn, "TEXT"),
@@ -103,9 +115,10 @@ pub const WindowManager = struct {
         const clipboard_conn = openClipboardConnection(io, environ, allocator);
         errdefer if (clipboard_conn) |clipboard| clipboard.close(io);
 
-        // Negotiate MIT-SHM while replies are still safe to read naively — once the event loop
-        // starts, its reader task owns the connection and would swallow any reply we waited for.
+        // Negotiate the extensions while replies are still safe to read naively — once the event
+        // loop starts, its reader task owns the connection and would swallow any reply we waited for.
         const shm_extension = probeShm(io, conn, info);
+        const xfixes_extension = probeXfixes(io, conn, info.screens[0].root, atoms.clipboard);
 
         const net_writer_buffer: []u8 = try allocator.alloc(u8, 4 * 1024);
         errdefer allocator.free(net_writer_buffer);
@@ -197,6 +210,11 @@ pub const WindowManager = struct {
 
             .shm = shm_extension,
             .clipboard_conn = clipboard_conn,
+            .xfixes = xfixes_extension,
+            .selections = .{
+                .{ .atom = atoms.clipboard },
+                .{ .atom = atoms.primary },
+            },
 
             .scaling = scaling,
 
@@ -231,7 +249,12 @@ pub const WindowManager = struct {
         self.allocator.free(self.keysym_map);
         self.compose.deinit();
         self.in_flight.deinit(self.allocator);
-        if (self.clipboard_text) |text| self.allocator.free(text);
+        self.reapIncrSends(.cancel);
+        self.incr_sends.deinit(self.allocator);
+        if (self.incr_paste) |*incr| incr.data.deinit(self.allocator);
+        for (&self.selections) |*selection| {
+            if (selection.text) |text| self.allocator.free(text);
+        }
         if (self.paste_result) |text| self.allocator.free(text);
         if (self.clipboard_conn) |clipboard| clipboard.close(self.io);
         self.conn.close(self.io);
@@ -285,11 +308,16 @@ pub const WindowManager = struct {
                     break :blk common.Event{ .nop = {} };
                 },
                 .SelectionClear => |clear| blk: {
-                    if (clear.selection == self.atoms.clipboard) self.dropClipboard(io, clear.owner);
+                    if (self.selectionOf(clear.selection)) |which| self.dropSelection(io, clear.owner, which);
                     break :blk common.Event{ .nop = {} };
                 },
                 .SelectionNotify => |notify| blk: {
                     self.finishPaste(io, notify);
+                    break :blk common.Event{ .nop = {} };
+                },
+                // An INCR owner announces each chunk with a property change on our window.
+                .PropertyNotify => |notify| blk: {
+                    self.continueIncrPaste(io, notify);
                     break :blk common.Event{ .nop = {} };
                 },
                 // Nothing waits for replies on this connection once the loop owns it (GrabPointer's
@@ -496,6 +524,11 @@ pub const WindowManager = struct {
                             self.clearSegmentInFlight(completion.shmseg);
                         }
                     }
+                    if (self.xfixes) |ext| {
+                        if (ext.isEvent(generic.code, x11.xfixes.Event.selection_notify)) {
+                            return self.mapSelectionOwnerChange(generic.as(x11.xfixes.SelectionNotify));
+                        }
+                    }
                     return .{ .nop = {} };
                 },
                 else => {
@@ -555,26 +588,34 @@ pub const WindowManager = struct {
         return state;
     }
 
-    /// The most text a single ChangeProperty can carry on this server, capped at
-    /// `max_clipboard_bytes`. Larger transfers need INCR, which is not implemented.
-    fn maxClipboardBytes(self: *const @This()) usize {
-        const request_limit = @as(usize, self.info.maximum_request_length) * 4;
-        return @min(max_clipboard_bytes, (request_limit -| @sizeOf(x11.proto.ChangeProperty)) & ~@as(usize, 3));
+    /// The state of one selection.
+    fn stateOf(self: *@This(), which: common.Selection) *OwnedSelection {
+        return &self.selections[@intFromEnum(which)];
     }
 
-    /// Store `text` and claim CLIPBOARD for `owner`; the reader task serves it to other clients
-    /// from then on, until a SelectionClear says somebody else copied.
-    pub fn copy(self: *@This(), owner: u32, text: []const u8) !void {
+    /// Which selection `atom` names, if one we handle.
+    fn selectionOf(self: *const @This(), atom: u32) ?common.Selection {
+        for (self.selections, 0..) |owned, index| {
+            if (owned.atom == atom) return @enumFromInt(index);
+        }
+        return null;
+    }
+
+    /// Store `text` and claim `which` for `owner`; the reader task serves it to other clients
+    /// from then on, until a SelectionClear says somebody else copied. Texts above one
+    /// request's worth are served through INCR.
+    pub fn copy(self: *@This(), owner: u32, text: []const u8, which: common.Selection) !void {
         if (self.clipboard_conn == null) return error.ClipboardUnsupported;
-        if (text.len > self.maxClipboardBytes()) return error.ClipboardUnsupported;
+        if (text.len > std.math.maxInt(u32)) return error.ClipboardUnsupported;
 
         const copied = try self.allocator.dupe(u8, text);
         {
             self.clipboard_mutex.lockUncancelable(self.io);
             defer self.clipboard_mutex.unlock(self.io);
-            if (self.clipboard_text) |old| self.allocator.free(old);
-            self.clipboard_text = copied;
-            self.clipboard_owner = owner;
+            const owned = self.stateOf(which);
+            if (owned.text) |old| self.allocator.free(old);
+            owned.text = copied;
+            owned.owner = owner;
         }
 
         // CurrentTime, as SDL and GLFW do. ICCCM prefers the triggering event's time, but the
@@ -583,43 +624,57 @@ pub const WindowManager = struct {
         // we do not. CurrentTime always takes.
         try x11.send(self.io, self.conn, x11.proto.SetSelectionOwner{
             .owner = owner,
-            .selection = self.atoms.clipboard,
+            .selection = self.stateOf(which).atom,
         });
     }
 
-    /// Forget the text we were serving. `owner` limits it to a loss by that window: a
-    /// SelectionClear for a window that already gave the selection up, or a window being
-    /// destroyed while another one owns it, must not drop the live text.
-    fn dropClipboard(self: *@This(), io: std.Io, owner: u32) void {
+    /// Forget the text we were serving for `which`. `owner` limits it to a loss by that
+    /// window: a SelectionClear for a window that already gave the selection up, or a window
+    /// being destroyed while another one owns it, must not drop the live text.
+    fn dropSelection(self: *@This(), io: std.Io, owner: u32, which: common.Selection) void {
         self.clipboard_mutex.lockUncancelable(io);
         defer self.clipboard_mutex.unlock(io);
-        if (self.clipboard_owner != owner) return;
-        if (self.clipboard_text) |text| self.allocator.free(text);
-        self.clipboard_text = null;
-        self.clipboard_owner = 0;
+        const owned = self.stateOf(which);
+        if (owned.owner != owner) return;
+        if (owned.text) |text| self.allocator.free(text);
+        owned.text = null;
+        owned.owner = 0;
     }
 
-    /// The clipboard's text as UTF-8, owned by the caller. Asks the owner to convert CLIPBOARD
+    /// XFixes reported a new CLIPBOARD owner. Our own claims are not news: the claiming window
+    /// is recorded before SetSelectionOwner goes out, so it is already the owner on record when
+    /// the server's notification comes back.
+    fn mapSelectionOwnerChange(self: *@This(), notify: x11.xfixes.SelectionNotify) common.Event {
+        if (notify.selection != self.atoms.clipboard or notify.subtype != .set_selection_owner) return .{ .nop = {} };
+        self.clipboard_mutex.lockUncancelable(self.io);
+        defer self.clipboard_mutex.unlock(self.io);
+        const owned = self.stateOf(.clipboard);
+        if (owned.owner != 0 and owned.owner == notify.owner) return .{ .nop = {} };
+        return .{ .clipboard_changed = {} };
+    }
+
+    /// The selection's text as UTF-8, owned by the caller. Asks the owner to convert `which`
     /// into a property on `requestor` and waits for the reader task to fetch it, at most
-    /// `paste_timeout`. Our own text takes the same route.
-    pub fn paste(self: *@This(), allocator: std.mem.Allocator, requestor: u32) ![]u8 {
+    /// `paste_timeout` without progress. Our own text takes the same route.
+    pub fn paste(self: *@This(), allocator: std.mem.Allocator, requestor: u32, which: common.Selection) ![]u8 {
         if (self.clipboard_conn == null) return error.ClipboardUnsupported;
 
         self.paste_mutex.lockUncancelable(self.io);
         defer self.paste_mutex.unlock(self.io);
 
         // No short-circuit to our own text: the server reports a lost selection with a
-        // SelectionClear the reader task may not have seen yet, so `clipboard_owner` lags the
+        // SelectionClear the reader task may not have seen yet, so the owner on record lags the
         // truth by a moment. Asking the server costs one round trip through our own serving path.
         // UTF8_STRING first; owners from before it refuse, and are asked for STRING instead.
-        return self.convertSelection(allocator, requestor, self.atoms.utf8_string) catch |err| switch (err) {
-            error.ClipboardEmpty => self.convertSelection(allocator, requestor, self.atoms.string),
+        const atom = self.stateOf(which).atom;
+        return self.convertSelection(allocator, requestor, atom, self.atoms.utf8_string) catch |err| switch (err) {
+            error.ClipboardEmpty => self.convertSelection(allocator, requestor, atom, self.atoms.string),
             else => err,
         };
     }
 
     /// One ConvertSelection round trip; see `paste`.
-    fn convertSelection(self: *@This(), allocator: std.mem.Allocator, requestor: u32, target: u32) ![]u8 {
+    fn convertSelection(self: *@This(), allocator: std.mem.Allocator, requestor: u32, selection_atom: u32, target: u32) ![]u8 {
         {
             self.clipboard_mutex.lockUncancelable(self.io);
             defer self.clipboard_mutex.unlock(self.io);
@@ -629,6 +684,7 @@ pub const WindowManager = struct {
             self.paste_pending = true;
             self.paste_generation +%= 1;
             self.paste_requestor = requestor;
+            self.paste_progress = 0;
             // No wait is pending: paste_mutex serialized the previous one to completion.
             self.paste_ready.reset();
         }
@@ -637,20 +693,30 @@ pub const WindowManager = struct {
         // input time would be.
         try x11.send(self.io, self.conn, x11.proto.ConvertSelection{
             .requestor = requestor,
-            .selection = self.atoms.clipboard,
+            .selection = selection_atom,
             .target = target,
             .property = self.atoms.mir_clipboard,
         });
 
-        self.paste_ready.waitTimeout(self.io, paste_timeout) catch |err| switch (err) {
-            error.Timeout => {
-                self.clipboard_mutex.lockUncancelable(self.io);
-                defer self.clipboard_mutex.unlock(self.io);
-                self.paste_pending = false;
-                return error.ClipboardTimeout;
-            },
-            error.Canceled => return err,
-        };
+        // An INCR owner delivers in chunks; the deadline restarts with each one, so a long text
+        // from a responsive owner is not cut off at one second.
+        var seen_progress: u32 = 0;
+        while (true) {
+            self.paste_ready.waitTimeout(self.io, paste_timeout) catch |err| switch (err) {
+                error.Timeout => {
+                    self.clipboard_mutex.lockUncancelable(self.io);
+                    defer self.clipboard_mutex.unlock(self.io);
+                    if (self.paste_progress != seen_progress) {
+                        seen_progress = self.paste_progress;
+                        continue;
+                    }
+                    self.paste_pending = false;
+                    return error.ClipboardTimeout;
+                },
+                error.Canceled => return err,
+            };
+            break;
+        }
 
         self.clipboard_mutex.lockUncancelable(self.io);
         defer self.clipboard_mutex.unlock(self.io);
@@ -676,18 +742,22 @@ pub const WindowManager = struct {
         return self.clipboard_sequence;
     }
 
-    /// Answer a client's request for our CLIPBOARD contents. Runs on the reader task; the
+    /// Answer a client's request for one of our selections. Runs on the reader task; the
     /// property write and the notify go out on `clipboard_conn`, since the requestor's window
-    /// belongs to another client and any connection may write to it.
+    /// belongs to another client and any connection may write to it. A text too long for one
+    /// request is handed to an `IncrSend` task, which answers the request itself.
     fn serveSelection(self: *@This(), io: std.Io, request: x11.proto.SelectionRequest) !void {
         // A copy, so the lock is not held while writing to the socket.
         const served: ?[]u8 = blk: {
             self.clipboard_mutex.lockUncancelable(io);
             defer self.clipboard_mutex.unlock(io);
-            if (self.clipboard_owner == 0 or request.selection != self.atoms.clipboard) break :blk null;
-            break :blk try self.allocator.dupe(u8, self.clipboard_text orelse "");
+            const which = self.selectionOf(request.selection) orelse break :blk null;
+            const owned = self.stateOf(which);
+            if (owned.owner == 0) break :blk null;
+            break :blk try self.allocator.dupe(u8, owned.text orelse "");
         };
-        defer if (served) |text| self.allocator.free(text);
+        var served_owned = served != null;
+        defer if (served_owned) self.allocator.free(served.?);
 
         // Pre-ICCCM requestors pass no property; the target names it then.
         var property: u32 = if (request.property != 0) request.property else request.target;
@@ -707,13 +777,21 @@ pub const WindowManager = struct {
                 // TEXT asks for whichever text type we like. STRING is Latin-1 by the book, but
                 // every toolkit answers it with the UTF-8 bytes, and so do we.
                 const property_type = if (request.target == atoms.text) atoms.utf8_string else request.target;
-                _ = try self.sendClipboard(io, x11.proto.ChangeProperty{
-                    .window_id = request.requestor,
-                    .property = property,
-                    .property_type = property_type,
-                    .format = 8,
-                    .length_of_data = @intCast(text.len),
-                }, text);
+                if (text.len > maxPropertyBytes(self.info)) {
+                    if (self.startIncrSend(io, request, property, property_type, text)) {
+                        served_owned = false; // the task owns the text now
+                        return;
+                    }
+                    property = 0;
+                } else {
+                    _ = try self.sendClipboard(io, x11.proto.ChangeProperty{
+                        .window_id = request.requestor,
+                        .property = property,
+                        .property_type = property_type,
+                        .format = 8,
+                        .length_of_data = @intCast(text.len),
+                    }, text);
+                }
             } else {
                 property = 0;
             }
@@ -735,10 +813,60 @@ pub const WindowManager = struct {
         }, null);
     }
 
+    /// Hand `text` to a task that transfers it to the requestor with INCR; returns false when
+    /// no task could be started, in which case the caller still owns `text` and refuses the
+    /// request. Reader task only.
+    fn startIncrSend(self: *@This(), io: std.Io, request: x11.proto.SelectionRequest, property: u32, property_type: u32, text: []u8) bool {
+        self.reapIncrSends(.finished);
+        const task = self.allocator.create(IncrSend) catch return false;
+        task.* = .{
+            .environ = self.environ,
+            .allocator = self.allocator,
+            .request = request,
+            .property = property,
+            .property_type = property_type,
+            .incr_atom = self.atoms.incr,
+            .text = text,
+        };
+        task.future = io.concurrent(IncrSend.run, .{ task, io }) catch |err| {
+            log.warn("INCR transfer task unavailable ({any}); refusing the request", .{err});
+            self.allocator.destroy(task);
+            return false;
+        };
+        self.incr_sends.append(self.allocator, task) catch {
+            task.future.?.await(io);
+            self.allocator.destroy(task);
+        };
+        return true;
+    }
+
+    /// Retire INCR send tasks: the finished ones, or all of them (canceling the rest) at
+    /// deinit. Reader task only.
+    fn reapIncrSends(self: *@This(), which: enum { finished, cancel }) void {
+        var index = self.incr_sends.items.len;
+        while (index > 0) {
+            index -= 1;
+            const task = self.incr_sends.items[index];
+            switch (which) {
+                .finished => if (!task.done.load(.acquire)) continue,
+                .cancel => {},
+            }
+            if (task.future) |*future| {
+                switch (which) {
+                    .finished => future.await(self.io),
+                    .cancel => future.cancel(self.io),
+                }
+            }
+            _ = self.incr_sends.swapRemove(index);
+            self.allocator.free(task.text);
+            self.allocator.destroy(task);
+        }
+    }
+
     const PasteOutcome = union(enum) { text: []u8, failure: common.ClipboardError };
 
     /// The owner answered a ConvertSelection: fetch the property it wrote and hand the text to
-    /// the waiting `paste`. Runs on the reader task.
+    /// the waiting `paste`, or begin collecting an INCR transfer. Runs on the reader task.
     fn finishPaste(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify) void {
         const generation = blk: {
             self.clipboard_mutex.lockUncancelable(io);
@@ -748,47 +876,138 @@ pub const WindowManager = struct {
             if (notify.property != 0 and notify.property != self.atoms.mir_clipboard) return;
             break :blk self.paste_generation;
         };
+        // A transfer left over from a paste that gave up has nothing to deliver to.
+        self.dropIncrPaste();
         if (notify.property == 0) {
             self.deliverPaste(io, generation, .{ .failure = error.ClipboardEmpty });
             return;
         }
-        const outcome = self.fetchPasteProperty(io, notify) catch |err| blk: {
+        const fetched = self.fetchPasteProperty(io, notify, generation) catch |err| blk: {
             log.warn("Failed to fetch the pasted property: {any}", .{err});
             break :blk PasteOutcome{ .failure = error.ClipboardEmpty };
         };
+        const outcome = fetched orelse return; // an INCR transfer has begun
         self.deliverPaste(io, generation, outcome);
     }
 
-    /// GetProperty on `clipboard_conn`, the only connection a reply can be read on once the
-    /// loop owns `conn`. Deleting the property tells an INCR owner to start, which we then
-    /// ignore; every other owner just sees its property cleaned up.
-    fn fetchPasteProperty(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify) !PasteOutcome {
-        const conn = self.clipboard_conn orelse return error.ClipboardUnsupported;
-        const sequence = try self.sendClipboard(io, x11.proto.GetProperty{
-            .window_id = notify.requestor,
-            .property = notify.property,
-            .property_type = 0, // AnyPropertyType
-            .long_offset = 0,
-            .long_length = @intCast(self.maxClipboardBytes() / 4),
-            .delete = true,
-        }, null);
-        const reply = try self.readClipboardReply(io, sequence);
-        const header = reply.as(x11.proto.GetPropertyReply);
+    /// Read the property the owner wrote. An INCR property holds the total size of a transfer
+    /// to come; deleting it tells the owner to start, and the chunks arrive through
+    /// `continueIncrPaste`, so this returns null and leaves `incr_paste` waiting for them.
+    fn fetchPasteProperty(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify, generation: u32) !?PasteOutcome {
+        var property = try self.readProperty(io, notify.requestor, notify.property);
+        defer property.value.deinit(self.allocator);
 
-        const extra = try self.allocator.alloc(u8, reply.extraLength());
-        defer self.allocator.free(extra);
-        try x11.receiveBytes(io, conn, extra);
+        if (property.property_type == self.atoms.incr) {
+            self.incr_paste = .{
+                .generation = generation,
+                .requestor = notify.requestor,
+                .property = notify.property,
+                .string = false,
+            };
+            return null;
+        }
+        if (property.property_type == 0 or property.format != 8) return .{ .failure = error.ClipboardEmpty };
 
-        if (header.property_type == self.atoms.incr) return .{ .failure = error.ClipboardUnsupported };
-        if (header.bytes_after != 0) return .{ .failure = error.ClipboardUnsupported };
-        if (header.property_type == 0 or header.format != 8) return .{ .failure = error.ClipboardEmpty };
-
-        const value = extra[0..@min(header.value_len, extra.len)];
-        const text = if (header.property_type == self.atoms.string)
-            try latin1ToUtf8(self.allocator, value)
+        const text = if (property.property_type == self.atoms.string)
+            try latin1ToUtf8(self.allocator, property.value.items)
         else
-            try self.allocator.dupe(u8, value);
+            try property.value.toOwnedSlice(self.allocator);
         return .{ .text = text };
+    }
+
+    /// An INCR owner wrote the next chunk into the paste property (or the empty one that ends
+    /// the transfer). Runs on the reader task.
+    fn continueIncrPaste(self: *@This(), io: std.Io, notify: x11.proto.PropertyNotify) void {
+        if (self.incr_paste == null) return;
+        const incr = &self.incr_paste.?;
+        if (notify.window_id != incr.requestor or notify.atom != incr.property or notify.state != .NewValue) return;
+        const generation = incr.generation;
+
+        const stale = blk: {
+            self.clipboard_mutex.lockUncancelable(io);
+            defer self.clipboard_mutex.unlock(io);
+            if (!self.paste_pending or self.paste_generation != generation) break :blk true;
+            self.paste_progress +%= 1;
+            break :blk false;
+        };
+        if (stale) {
+            // The caller gave up; the owner will stop once we stop deleting the property.
+            self.dropIncrPaste();
+            return;
+        }
+
+        const collected = self.collectIncrChunk(io, incr) catch |err| blk: {
+            log.warn("Failed to collect an INCR chunk: {any}", .{err});
+            break :blk PasteOutcome{ .failure = error.ClipboardEmpty };
+        };
+        const outcome = collected orelse return; // more chunks to come
+        self.dropIncrPaste();
+        self.deliverPaste(io, generation, outcome);
+    }
+
+    /// Read the chunk the owner just wrote and append it; the empty chunk completes the text.
+    fn collectIncrChunk(self: *@This(), io: std.Io, incr: *IncrPaste) !?PasteOutcome {
+        var chunk = try self.readProperty(io, incr.requestor, incr.property);
+        defer chunk.value.deinit(self.allocator);
+        if (chunk.value.items.len == 0) {
+            const text = if (incr.string)
+                try latin1ToUtf8(self.allocator, incr.data.items)
+            else
+                try incr.data.toOwnedSlice(self.allocator);
+            return .{ .text = text };
+        }
+        // The chunks name the text type; the INCR property itself did not.
+        incr.string = chunk.property_type == self.atoms.string;
+        try incr.data.appendSlice(self.allocator, chunk.value.items);
+        return null;
+    }
+
+    fn dropIncrPaste(self: *@This()) void {
+        if (self.incr_paste) |*incr| incr.data.deinit(self.allocator);
+        self.incr_paste = null;
+    }
+
+    const Property = struct {
+        property_type: u32,
+        format: u8,
+        value: std.ArrayList(u8),
+    };
+
+    /// GetProperty on `clipboard_conn`, the only connection a reply can be read on once the
+    /// loop owns `conn`, in `property_read_bytes` pieces until the server has no more. The
+    /// property is deleted with the last piece: that is how a requestor tells an INCR owner it
+    /// is ready for the next chunk, and every other owner just sees its property cleaned up.
+    fn readProperty(self: *@This(), io: std.Io, window: u32, property: u32) !Property {
+        const conn = self.clipboard_conn orelse return error.ClipboardUnsupported;
+        var result: Property = .{ .property_type = 0, .format = 0, .value = .empty };
+        errdefer result.value.deinit(self.allocator);
+
+        var offset_units: u32 = 0;
+        while (true) {
+            const sequence = try self.sendClipboard(io, x11.proto.GetProperty{
+                .window_id = window,
+                .property = property,
+                .property_type = 0, // AnyPropertyType
+                .long_offset = offset_units,
+                .long_length = property_read_bytes / 4,
+                .delete = true,
+            }, null);
+            const reply = try self.readClipboardReply(io, sequence);
+            const header = reply.as(x11.proto.GetPropertyReply);
+
+            const extra = try self.allocator.alloc(u8, reply.extraLength());
+            defer self.allocator.free(extra);
+            try x11.receiveBytes(io, conn, extra);
+
+            result.property_type = header.property_type;
+            result.format = header.format;
+            if (header.property_type == 0) return result;
+            const unit: usize = @max(1, @as(usize, header.format) / 8);
+            const bytes = @min(@as(usize, header.value_len) * unit, extra.len);
+            try result.value.appendSlice(self.allocator, extra[0..bytes]);
+            if (header.bytes_after == 0) return result;
+            offset_units += @intCast(bytes / 4);
+        }
     }
 
     /// Read `clipboard_conn` until the reply to request `sequence`. Errors from earlier
@@ -830,12 +1049,136 @@ pub const WindowManager = struct {
     }
 };
 
-/// How long a paste waits for the owner. The server answers an ownerless selection at once, so
-/// only an owner that is hung or gone runs this out.
+/// How long a paste waits for the owner to answer, or to send the next INCR chunk. The server
+/// answers an ownerless selection at once, so only an owner that is hung or gone runs this out.
 const paste_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } };
 
-/// The largest text a copy accepts; see `WindowManager.maxClipboardBytes`.
-const max_clipboard_bytes: usize = 256 * 1024;
+/// How long an INCR transfer we are sending waits for the requestor to take each chunk.
+const incr_step_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+
+/// How much of a property one GetProperty asks for; longer values are read in several.
+const property_read_bytes: u32 = 256 * 1024;
+
+const selection_count = @typeInfo(common.Selection).@"enum".fields.len;
+
+/// The most text a single ChangeProperty can carry on this server, and so the INCR chunk size.
+fn maxPropertyBytes(info: x11.Setup) usize {
+    const request_limit = @as(usize, info.maximum_request_length) * 4;
+    return (request_limit -| @sizeOf(x11.proto.ChangeProperty)) & ~@as(usize, 3);
+}
+
+/// One selection we may own: its atom, the text served for it and the window that claimed it.
+const OwnedSelection = struct {
+    atom: u32,
+    /// Null once another client took the selection.
+    text: ?[]u8 = null,
+    /// 0 while we do not own it.
+    owner: u32 = 0,
+};
+
+/// An INCR transfer being received: the owner appends chunks to `property` on `requestor`,
+/// each announced by a PropertyNotify, until an empty one.
+const IncrPaste = struct {
+    generation: u32,
+    requestor: u32,
+    property: u32,
+    /// Whether the chunks came typed STRING (Latin-1) rather than UTF8_STRING.
+    string: bool,
+    data: std.ArrayList(u8) = .empty,
+};
+
+/// One INCR transfer of our text to a requestor, on a connection of its own so the reader task
+/// never waits on the requestor. ICCCM 2.7.2: set an INCR property holding the total size,
+/// select PropertyNotify on the requestor, send the SelectionNotify; then, each time the
+/// requestor deletes the property, write the next chunk, and after the last chunk an empty one.
+const IncrSend = struct {
+    environ: std.process.Environ,
+    allocator: std.mem.Allocator,
+    request: x11.proto.SelectionRequest,
+    property: u32,
+    property_type: u32,
+    incr_atom: u32,
+    text: []u8,
+    future: ?std.Io.Future(void) = null,
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn run(task: *IncrSend, io: std.Io) void {
+        defer task.done.store(true, .release);
+        task.transfer(io) catch |err| log.warn("INCR transfer of {d} bytes to window 0x{x} failed: {any}", .{ task.text.len, task.request.requestor, err });
+    }
+
+    fn transfer(task: *IncrSend, io: std.Io) !void {
+        const conn = try x11.connect(io, task.environ, .{});
+        defer conn.close(io);
+        const info = try x11.setup(io, task.environ, task.allocator, conn);
+        defer info.deinit();
+        const chunk_bytes = maxPropertyBytes(info);
+        const requestor = task.request.requestor;
+
+        // Every client keeps its own event mask on a window, so selecting PropertyNotify on the
+        // requestor's window from here disturbs nobody.
+        const values = x11.proto.WindowValue{ .EventMask = x11.mask(&[_]x11.proto.EventMask{.PropertyChange}) };
+        try x11.sendWithValues(io, conn, x11.proto.ChangeWindowAttributes{
+            .window_id = requestor,
+            .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
+        }, values);
+        const total: u32 = @intCast(task.text.len);
+        try x11.sendWithBytes(io, conn, x11.proto.ChangeProperty{
+            .window_id = requestor,
+            .property = task.property,
+            .property_type = task.incr_atom,
+            .format = 32,
+            .length_of_data = 1,
+        }, std.mem.asBytes(&total));
+        const notify = x11.proto.SelectionNotify{
+            .time = task.request.time,
+            .requestor = requestor,
+            .selection = task.request.selection,
+            .target = task.request.target,
+            .property = task.property,
+        };
+        try x11.send(io, conn, x11.proto.SendEvent{
+            .destination = requestor,
+            .event_mask = 0,
+            .event = std.mem.toBytes(notify),
+        });
+
+        var offset: usize = 0;
+        while (true) {
+            // The first deletion is of the INCR property itself: the requestor is ready.
+            try task.awaitDeletion(io, conn);
+            const chunk = task.text[offset..@min(offset + chunk_bytes, task.text.len)];
+            try x11.sendWithBytes(io, conn, x11.proto.ChangeProperty{
+                .window_id = requestor,
+                .property = task.property,
+                .property_type = task.property_type,
+                .format = 8,
+                .length_of_data = @intCast(chunk.len),
+            }, chunk);
+            if (chunk.len == 0) return; // the empty property ends the transfer
+            offset += chunk.len;
+        }
+    }
+
+    /// Block until the requestor deletes the property, which is how it asks for more.
+    fn awaitDeletion(task: *IncrSend, io: std.Io, conn: std.Io.net.Stream) !void {
+        while (true) {
+            const message = try x11.receive(io, conn, incr_step_timeout) orelse return error.IncrRequestorStalled;
+            switch (message) {
+                .PropertyNotify => |notify| {
+                    if (notify.window_id == task.request.requestor and notify.atom == task.property and notify.state == .Deleted) return;
+                },
+                // The requestor's window went away mid-transfer.
+                .ErrorMessage => |failure| {
+                    log.debug("X11 error during an INCR transfer: {any}", .{failure.error_code});
+                    return error.RequestFailed;
+                },
+                .Reply => |reply| try skipBytes(io, conn, reply.extraLength()),
+                else => {},
+            }
+        }
+    }
+};
 
 /// The reader task's own connection for selection traffic; see `WindowManager.clipboard_conn`.
 fn openClipboardConnection(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) ?std.Io.net.Stream {
@@ -850,6 +1193,21 @@ fn openClipboardConnection(io: std.Io, environ: std.process.Environ, allocator: 
     };
     info.deinit();
     return conn;
+}
+
+/// Negotiate XFixes and ask for CLIPBOARD owner changes, reported on `root` (a window of our
+/// own is not needed: the events go to the client that asked). Null means no
+/// `clipboard_changed` events, which is a degradation, never an error.
+fn probeXfixes(io: std.Io, conn: std.Io.net.Stream, root: u32, clipboard: u32) ?x11.Extension {
+    const extension = x11.xfixes.probe(io, conn) catch |err| {
+        log.warn("XFixes probe failed ({any}); no clipboard_changed events", .{err});
+        return null;
+    } orelse return null;
+    x11.xfixes.selectSelectionInput(io, conn, extension, root, clipboard, x11.xfixes.SelectionEventMask.set_selection_owner) catch |err| {
+        log.warn("XFixes SelectSelectionInput failed ({any}); no clipboard_changed events", .{err});
+        return null;
+    };
+    return extension;
 }
 
 /// Read and drop `count` bytes: the trailing data of a reply nobody decodes.
@@ -989,8 +1347,9 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        // The server drops a destroyed window's selection without a SelectionClear.
-        self.wm.dropClipboard(self.wm.io, self.window_id);
+        // The server drops a destroyed window's selections without a SelectionClear.
+        self.wm.dropSelection(self.wm.io, self.window_id, .clipboard);
+        self.wm.dropSelection(self.wm.io, self.window_id, .primary);
         x11.send(self.wm.io, self.wm.conn, x11.proto.DestroyWindow{ .window_id = self.window_id }) catch |err| {
             log.err("Error destroying window: {any}", .{err});
         };
@@ -998,13 +1357,24 @@ pub const Window = struct {
 
     /// Put `text` on the system clipboard, with this window as the selection owner.
     pub fn setClipboardText(self: *@This(), text: []const u8) !void {
-        return self.wm.copy(self.window_id, text);
+        return self.wm.copy(self.window_id, text, .clipboard);
     }
 
     /// The clipboard's text as UTF-8, owned by the caller. Blocks until the owner answers, at
-    /// most one second.
+    /// most one second between chunks.
     pub fn getClipboardText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
-        return self.wm.paste(allocator, self.window_id);
+        return self.wm.paste(allocator, self.window_id, .clipboard);
+    }
+
+    /// Put `text` on the primary selection (the one middle-click pastes), with this window as
+    /// the owner.
+    pub fn setPrimaryText(self: *@This(), text: []const u8) !void {
+        return self.wm.copy(self.window_id, text, .primary);
+    }
+
+    /// The primary selection's text as UTF-8, owned by the caller; see `getClipboardText`.
+    pub fn getPrimaryText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        return self.wm.paste(allocator, self.window_id, .primary);
     }
 
     pub fn close(self: *@This()) void {
@@ -1828,9 +2198,22 @@ test "clipboard entry points compile" {
     _ = &WindowManager.copy;
     _ = &WindowManager.paste;
     _ = &WindowManager.receiveIo;
+    _ = &WindowManager.deinit;
     _ = &Window.setClipboardText;
     _ = &Window.getClipboardText;
+    _ = &Window.setPrimaryText;
+    _ = &Window.getPrimaryText;
     _ = &Window.deinit;
+    _ = &IncrSend.run;
+}
+
+test "maxPropertyBytes leaves room for the request header and stays word-aligned" {
+    var info: x11.Setup = undefined;
+    info.maximum_request_length = 65535;
+    try testing.expectEqual(@as(usize, 65535 * 4 - @sizeOf(x11.proto.ChangeProperty)), maxPropertyBytes(info));
+    try testing.expectEqual(@as(usize, 0), maxPropertyBytes(info) % 4);
+    info.maximum_request_length = 5;
+    try testing.expectEqual(@as(usize, 0), maxPropertyBytes(info));
 }
 
 const Atoms = struct {
@@ -1844,6 +2227,7 @@ const Atoms = struct {
     net_wm_state_fullscreen: u32,
     net_wm_icon: u32,
     clipboard: u32,
+    primary: u32,
     utf8_string: u32,
     targets: u32,
     text: u32,

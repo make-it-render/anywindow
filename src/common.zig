@@ -49,15 +49,23 @@ pub const WindowStatus = enum {
     closed,
 };
 
-/// What `Window.getClipboardText` and `Window.setClipboardText` fail with.
+/// What the clipboard and primary-selection methods on `Window` fail with.
 pub const ClipboardError = error{
-    /// Nothing, or nothing textual, is on the clipboard.
+    /// Nothing, or nothing textual, is on the selection. Always the answer of `getPrimaryText`
+    /// on Windows, which has no primary selection.
     ClipboardEmpty,
-    /// The clipboard owner never answered.
+    /// The selection owner never answered, or stopped mid-transfer.
     ClipboardTimeout,
-    /// The backend cannot do this transfer: no clipboard on this connection, a text too large
-    /// for one X11 request, an X11 owner that insists on INCR, a Wayland copy before any input.
+    /// The backend cannot do this transfer: no clipboard on this connection, a compositor
+    /// without the primary-selection protocol, a Wayland copy before any input.
     ClipboardUnsupported,
+};
+
+/// The two X11-style selections a `Window` can copy to and paste from: the clipboard proper,
+/// and the primary selection that middle-click pastes on Linux desktops.
+pub const Selection = enum {
+    clipboard,
+    primary,
 };
 
 pub const Event = union(enum) {
@@ -139,6 +147,15 @@ pub const Event = union(enum) {
         window_id: WindowID,
         scale: f32,
     },
+    /// Some client claimed the system clipboard, so a `getClipboardText`
+    /// would now return something else. Not sent for this process's own
+    /// `setClipboardText` where the platform lets the backend tell (X11
+    /// through XFixes, Win32 through the clipboard sequence number). On
+    /// Wayland the compositor announces the selection again whenever one of
+    /// our windows gains keyboard focus, since nothing reaches an unfocused
+    /// client, so the event can also mean "it may have changed while you
+    /// were away". The primary selection never raises it.
+    clipboard_changed: void,
 };
 
 pub const Cursor = enum {

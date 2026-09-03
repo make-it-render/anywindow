@@ -94,17 +94,30 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("verify: ok\n", .{});
 }
 
-/// The clipboard five ways: our text served to a foreign client (wl-paste or
+/// The clipboard many ways: our text served to a foreign client (wl-paste or
 /// xclip), a self round trip through the server so the serving path runs end
 /// to end in one process, a foreign client's text pasted here, a copy made
-/// after that foreign claim, and (X11) an owner that never answers, which a
-/// paste must time out on. The reader runs on a task meanwhile, as it does
-/// under recvloop: the serving side lives there, and the main thread must be
-/// free to block in child processes and in the paste itself.
+/// after that foreign claim, (X11) an owner that never answers, which a paste
+/// must time out on, then the same three transfers with a text far above one
+/// X11 request (INCR both ways), and the primary selection. The reader runs
+/// on a task meanwhile, as it does under recvloop: the serving side lives
+/// there, the main thread must be free to block in child processes and in
+/// the paste itself, and it counts the `clipboard_changed` events: none for
+/// our own copies, one per foreign claim.
 fn verifyClipboard(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator, wm: *win.WindowManager, window: *win.Window) !void {
     const tools: ClipboardTools = switch (wm.*) {
-        .wayland => .{ .paste = &.{ "wl-paste", "--no-newline" }, .copy = &.{"wl-copy"}, .copy_from_stdin = false },
-        .x11 => .{ .paste = &.{ "xclip", "-selection", "clipboard", "-o" }, .copy = &.{ "xclip", "-selection", "clipboard", "-i" }, .copy_from_stdin = true },
+        .wayland => .{
+            .paste = &.{ "wl-paste", "--no-newline" },
+            .copy = &.{"wl-copy"},
+            .paste_primary = &.{ "wl-paste", "--primary", "--no-newline" },
+            .copy_primary = &.{ "wl-copy", "--primary" },
+        },
+        .x11 => .{
+            .paste = &.{ "xclip", "-selection", "clipboard", "-o" },
+            .copy = &.{ "xclip", "-selection", "clipboard", "-i" },
+            .paste_primary = &.{ "xclip", "-selection", "primary", "-o" },
+            .copy_primary = &.{ "xclip", "-selection", "primary", "-i" },
+        },
     };
 
     // A Wayland copy needs an input serial; the compositor hands one over
@@ -121,44 +134,74 @@ fn verifyClipboard(io: std.Io, environ: std.process.Environ, allocator: std.mem.
         }
     }
 
-    var reader = try io.concurrent(readerLoop, .{ io, wm });
+    var changes = std.atomic.Value(u32).init(0);
+    var reader = try io.concurrent(readerLoop, .{ io, wm, &changes });
     defer reader.cancel(io);
+
+    // Our own copies all come first: on Wayland a copy reuses the last input
+    // serial, and once a foreign client has claimed the selection with a
+    // newer one the compositor drops ours (step 4 shows it).
 
     // 1. Served: our text, fetched by a foreign client.
     const ours = try std.fmt.allocPrint(allocator, "mir clipboard {d}", .{nonce(io)});
     defer allocator.free(ours);
     try window.setClipboardText(ours);
-    {
-        const fetched = try runTool(io, allocator, tools.paste, null, true);
-        defer allocator.free(fetched);
-        if (!std.mem.eql(u8, fetched, ours)) {
-            std.debug.print("clipboard: foreign paste got \"{s}\", expected \"{s}\"\n", .{ fetched, ours });
-            return error.ClipboardServeMismatch;
-        }
-    }
-    std.debug.print("clipboard: served to {s}: ok\n", .{tools.paste[0]});
+    try expectServed(io, allocator, tools.paste, ours, "clipboard");
+    try expectChanges(io, &changes, 0, "our own copy");
 
     // 2. Self, through the server: a paste never short-circuits to our own
     // text, so the reader task serves our own request here.
     const again = try std.fmt.allocPrint(allocator, "mir round trip {d}", .{nonce(io)});
     defer allocator.free(again);
     try window.setClipboardText(again);
-    try expectPaste(io, allocator, window, again, "server round trip");
+    try expectPaste(io, allocator, window, .clipboard, again, "server round trip");
     std.debug.print("clipboard: round trip through the server: ok\n", .{});
+    try expectChanges(io, &changes, 0, "our own copy and paste");
 
-    // 3. Foreign: a tool owns the selection, we paste it.
+    // 3. A text far beyond one X11 request: served to the tool (INCR on
+    // X11) and round-tripped through ourselves (INCR both sides on X11).
+    // Wayland moves it through a pipe either way.
+    const big = try largeText(allocator, nonce(io));
+    defer allocator.free(big);
+    try window.setClipboardText(big);
+    try expectServed(io, allocator, tools.paste, big, "1 MiB clipboard");
+    const big_again = try largeText(allocator, nonce(io));
+    defer allocator.free(big_again);
+    try window.setClipboardText(big_again);
+    try expectPaste(io, allocator, window, .clipboard, big_again, "1 MiB server round trip");
+    std.debug.print("clipboard: 1 MiB round trip through the server: ok\n", .{});
+    try expectChanges(io, &changes, 0, "our own 1 MiB copies");
+
+    // 4. The primary selection, served and round-tripped the same way, with
+    // no clipboard_changed for either.
+    const primary = try std.fmt.allocPrint(allocator, "mir primary {d}", .{nonce(io)});
+    defer allocator.free(primary);
+    const primary_supported = if (window.setPrimaryText(primary)) true else |err| switch (err) {
+        error.ClipboardUnsupported => false,
+        else => return err,
+    };
+    const primary_again = try std.fmt.allocPrint(allocator, "mir primary round trip {d}", .{nonce(io)});
+    defer allocator.free(primary_again);
+    if (primary_supported) {
+        try expectServed(io, allocator, tools.paste_primary, primary, "primary");
+        try window.setPrimaryText(primary_again);
+        try expectPaste(io, allocator, window, .primary, primary_again, "primary server round trip");
+        std.debug.print("primary: round trip through the server: ok\n", .{});
+        try expectChanges(io, &changes, 0, "our own primary copies");
+    } else {
+        std.debug.print("primary: unsupported here, skipped\n", .{});
+    }
+
+    // 5. Foreign: a tool owns the selection, we paste it — and the reader
+    // must have seen exactly one clipboard_changed for the claim.
     const theirs = try std.fmt.allocPrint(allocator, "from {s} {d}", .{ tools.copy[0], nonce(io) });
     defer allocator.free(theirs);
-    if (tools.copy_from_stdin) {
-        allocator.free(try runTool(io, allocator, tools.copy, theirs, false));
-    } else {
-        const argv = [_][]const u8{ tools.copy[0], theirs };
-        allocator.free(try runTool(io, allocator, &argv, null, false));
-    }
-    try expectPaste(io, allocator, window, theirs, "foreign owner");
+    allocator.free(try runTool(io, allocator, tools.copy, theirs, false));
+    try expectPaste(io, allocator, window, .clipboard, theirs, "foreign owner");
     std.debug.print("clipboard: pasted from {s}: ok\n", .{tools.copy[0]});
+    try expectChanges(io, &changes, 1, "a foreign copy");
 
-    // 4. A copy with no new input since the foreign claim. X11 claims with
+    // 6. A copy with no new input since the foreign claim. X11 claims with
     // CurrentTime, so it must take. Wayland reuses the last input serial,
     // which is now older than the selection's; whether the compositor still
     // accepts it is its call, so that is reported rather than judged.
@@ -179,6 +222,28 @@ fn verifyClipboard(io: std.Io, environ: std.process.Environ, allocator: std.mem.
             },
             .wayland => std.debug.print("clipboard: copy reusing an old serial after a foreign claim: {s} by the compositor\n", .{if (taken) "taken" else "dropped"}),
         }
+    }
+    try expectChanges(io, &changes, 1, "a second copy of our own");
+
+    // 7. A 1 MiB text from the tool (xclip serves INCR above a quarter of
+    // the request limit).
+    const big_theirs = try largeText(allocator, nonce(io));
+    defer allocator.free(big_theirs);
+    allocator.free(try runTool(io, allocator, tools.copy, big_theirs, false));
+    try expectPaste(io, allocator, window, .clipboard, big_theirs, "1 MiB foreign owner");
+    std.debug.print("clipboard: 1 MiB pasted from {s}: ok\n", .{tools.copy[0]});
+    try expectChanges(io, &changes, 2, "a foreign 1 MiB copy");
+
+    // 8. A foreign primary claim, which must leave the clipboard alone and
+    // raise nothing.
+    if (primary_supported) {
+        const primary_theirs = try std.fmt.allocPrint(allocator, "primary from {s} {d}", .{ tools.copy_primary[0], nonce(io) });
+        defer allocator.free(primary_theirs);
+        allocator.free(try runTool(io, allocator, tools.copy_primary, primary_theirs, false));
+        try expectPaste(io, allocator, window, .primary, primary_theirs, "primary foreign owner");
+        std.debug.print("primary: pasted from {s}: ok\n", .{tools.copy_primary[0]});
+        try expectPaste(io, allocator, window, .clipboard, big_theirs, "clipboard after primary traffic");
+        try expectChanges(io, &changes, 2, "a foreign primary copy");
     }
 
     // 5. An owner that never answers (X11 only: a bare connection that claims
@@ -222,6 +287,7 @@ fn verifyClipboard(io: std.Io, environ: std.process.Environ, allocator: std.mem.
         }
         const waited_ms = @divTrunc(started.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds, std.time.ns_per_ms);
         std.debug.print("clipboard: silent owner timed out after {d} ms: ok\n", .{waited_ms});
+        try expectChanges(io, &changes, 3, "the silent owner's claim");
 
         silent.close(io);
         silent_open = false;
@@ -236,15 +302,77 @@ fn verifyClipboard(io: std.Io, environ: std.process.Environ, allocator: std.mem.
             else => return err,
         }
         std.debug.print("clipboard: empty after the owner left: ok\n", .{});
+        // Only claims are subscribed to, so the loss itself raises nothing —
+        // but a desktop's clipboard manager (klipper through kwin's XWayland
+        // bridge) may claim the ownerless selection a moment later, which
+        // is a change like any other. Reported, not judged.
+        try io.sleep(std.Io.Duration.fromMilliseconds(200), .awake);
+        const after_loss = changes.load(.monotonic);
+        if (after_loss < 3) return error.ClipboardChangedMismatch;
+        std.debug.print("clipboard_changed: {d} in all after the silent owner left ({s})\n", .{ after_loss, if (after_loss > 3) "a clipboard manager re-claimed it" else "nothing re-claimed it" });
     }
 }
 
 const ClipboardTools = struct {
     paste: []const []const u8,
+    /// Takes the text on stdin. wl-copy would also take it as an argument, but
+    /// a megabyte does not fit in one.
     copy: []const []const u8,
-    /// xclip takes the text on stdin; wl-copy takes it as an argument.
-    copy_from_stdin: bool,
+    paste_primary: []const []const u8,
+    copy_primary: []const []const u8,
 };
+
+/// A megabyte: four times what one X11 request carries, so both sides of an
+/// INCR transfer run several chunks.
+const large_text_bytes = 1024 * 1024;
+
+/// `large_text_bytes` of pseudo-random lowercase lines seeded by `seed`, so
+/// two texts of the same size never compare equal by accident.
+fn largeText(allocator: std.mem.Allocator, seed: u32) ![]u8 {
+    const text = try allocator.alloc(u8, large_text_bytes);
+    var state = seed;
+    for (text, 0..) |*byte, index| {
+        if (index % 64 == 63 and index + 1 != text.len) {
+            byte.* = '\n';
+            continue;
+        }
+        state = state *% 1664525 +% 1013904223;
+        byte.* = 'a' + @as(u8, @intCast((state >> 24) % 26));
+    }
+    return text;
+}
+
+/// Fetch the selection with a foreign tool and check it is `expected`.
+fn expectServed(io: std.Io, allocator: std.mem.Allocator, paste_tool: []const []const u8, expected: []const u8, what: []const u8) !void {
+    const fetched = try runTool(io, allocator, paste_tool, null, true);
+    defer allocator.free(fetched);
+    if (!std.mem.eql(u8, fetched, expected)) {
+        if (expected.len > 80) {
+            std.debug.print("{s}: foreign paste got {d} bytes, expected {d}{s}\n", .{ what, fetched.len, expected.len, if (fetched.len == expected.len) " (same length, different bytes)" else "" });
+        } else {
+            std.debug.print("{s}: foreign paste got \"{s}\", expected \"{s}\"\n", .{ what, fetched, expected });
+        }
+        return error.ClipboardServeMismatch;
+    }
+    std.debug.print("{s}: served to {s} ({d} bytes): ok\n", .{ what, paste_tool[0], expected.len });
+}
+
+/// Wait for the reader to have counted `expected` clipboard_changed events in
+/// all, then check no more came.
+fn expectChanges(io: std.Io, changes: *std.atomic.Value(u32), expected: u32, what: []const u8) !void {
+    var polls: u32 = 0;
+    while (changes.load(.monotonic) < expected and polls < 50) : (polls += 1) {
+        try io.sleep(std.Io.Duration.fromMilliseconds(20), .awake);
+    }
+    // A late extra one would show up here; give it a moment.
+    try io.sleep(std.Io.Duration.fromMilliseconds(100), .awake);
+    const got = changes.load(.monotonic);
+    if (got != expected) {
+        std.debug.print("clipboard_changed: {d} events in all after {s}, expected {d}\n", .{ got, what, expected });
+        return error.ClipboardChangedMismatch;
+    }
+    std.debug.print("clipboard_changed: {d} in all after {s}: ok\n", .{ got, what });
+}
 
 /// Run a clipboard tool with `stdin_text` on its stdin (if any) and return
 /// its stdout when `capture` is set. The copy tools fork a daemon that keeps
@@ -289,10 +417,14 @@ fn runTool(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8, s
 /// Paste until `expected` comes back. The server announces a changed
 /// selection asynchronously, so until then a paste is empty or still returns
 /// the previous owner's text.
-fn expectPaste(io: std.Io, allocator: std.mem.Allocator, window: *win.Window, expected: []const u8, what: []const u8) !void {
+fn expectPaste(io: std.Io, allocator: std.mem.Allocator, window: *win.Window, which: win.common.Selection, expected: []const u8, what: []const u8) !void {
     var tries: u32 = 0;
     while (true) : (tries += 1) {
-        const pasted = window.getClipboardText(allocator) catch |err| switch (err) {
+        const result = switch (which) {
+            .clipboard => window.getClipboardText(allocator),
+            .primary => window.getPrimaryText(allocator),
+        };
+        const pasted = result catch |err| switch (err) {
             error.ClipboardEmpty => if (tries < paste_tries) {
                 try io.sleep(paste_retry, .awake);
                 continue;
@@ -305,7 +437,11 @@ fn expectPaste(io: std.Io, allocator: std.mem.Allocator, window: *win.Window, ex
             try io.sleep(paste_retry, .awake);
             continue;
         }
-        std.debug.print("clipboard: {s} paste got \"{s}\", expected \"{s}\"\n", .{ what, pasted, expected });
+        if (expected.len > 80) {
+            std.debug.print("clipboard: {s} paste got {d} bytes, expected {d}{s}\n", .{ what, pasted.len, expected.len, if (pasted.len == expected.len) " (same length, different bytes)" else "" });
+        } else {
+            std.debug.print("clipboard: {s} paste got \"{s}\", expected \"{s}\"\n", .{ what, pasted, expected });
+        }
         return error.ClipboardPasteMismatch;
     }
 }
@@ -320,10 +456,14 @@ fn nonce(io: std.Io) u32 {
 }
 
 /// The reader task's loop while the clipboard check owns the main thread.
-/// Events are dropped; the socket read is the cancelation point.
-fn readerLoop(io: std.Io, wm: *win.WindowManager) void {
+/// It counts `clipboard_changed` and drops everything else; the socket read
+/// is the cancelation point.
+fn readerLoop(io: std.Io, wm: *win.WindowManager, changes: *std.atomic.Value(u32)) void {
     while (true) {
-        _ = wm.receiveIo(io) catch return;
+        const event = wm.receiveIo(io) catch return;
+        if (event) |received| {
+            if (received == .clipboard_changed) _ = changes.fetchAdd(1, .monotonic);
+        }
     }
 }
 

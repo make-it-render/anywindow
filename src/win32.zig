@@ -302,6 +302,9 @@ pub const Window = struct {
             _ = win.GlobalFree(block);
             return error.ClipboardUnsupported;
         }
+        // Our own change is not news: the WM_CLIPBOARDUPDATE it raises (on CloseClipboard,
+        // below) quotes this sequence number and is dropped as already reported.
+        reported_clipboard_sequence.store(win.GetClipboardSequenceNumber(), .monotonic);
     }
 
     /// The clipboard's text as UTF-8, owned by the caller, with CRLF folded back to LF.
@@ -315,6 +318,18 @@ pub const Window = struct {
         const size = win.GlobalSize(block);
         const units: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, memory[0 .. size - size % 2]));
         return utf8FromClipboardUnits(allocator, units);
+    }
+
+    /// Windows has no primary selection (nothing middle-click pastes), so there is nowhere
+    /// to put the text: a no-op that succeeds.
+    pub fn setPrimaryText(_: *@This(), text: []const u8) !void {
+        _ = text;
+    }
+
+    /// Windows has no primary selection, so it is always empty: `error.ClipboardEmpty`.
+    pub fn getPrimaryText(_: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        _ = allocator;
+        return error.ClipboardEmpty;
     }
 
     pub fn beginDraw(self: *@This()) !void {
@@ -486,6 +501,10 @@ pub const Image = struct {
 
 var class_count = std.atomic.Value(usize).init(0);
 var events: queue.ThreadSafeQueue(common.Event) = undefined;
+/// The clipboard sequence number of the last change surfaced as `clipboard_changed` (or made
+/// by `setClipboardText`). Every window's thread gets its own WM_CLIPBOARDUPDATE for one
+/// change; this makes it one event, and none for our own copies.
+var reported_clipboard_sequence = std.atomic.Value(u32).init(0);
 var active_cursor: ?win.CursorHandler = null;
 var saved_cursor: ?win.CursorHandler = null;
 var cursor_hidden: bool = false;
@@ -540,6 +559,11 @@ const WindowThread = struct {
             return;
         }
         self.handle = handle;
+        // Clipboard changes arrive as WM_CLIPBOARDUPDATE on this thread's pump; the system
+        // unregisters the window when it is destroyed.
+        if (win.AddClipboardFormatListener(handle.?) == 0) {
+            log.debug("AddClipboardFormatListener failed ({d}); no clipboard_changed events", .{win.GetLastError()});
+        }
 
         const frame = win.CreateCompatibleDC(null);
         if (frame == null) {
@@ -839,11 +863,34 @@ pub fn windowProc(
                 },
             });
         },
+        .WM_CLIPBOARDUPDATE => {
+            if (noteClipboardSequence(win.GetClipboardSequenceNumber())) {
+                events.push(.{ .clipboard_changed = {} });
+            }
+            return 0;
+        },
         else => {
             return win.DefWindowProcW(window_handle, message_type, wparam, lparam);
         },
     }
     return 1;
+}
+
+/// Whether a WM_CLIPBOARDUPDATE quoting `sequence` is a change nobody has reported yet; see
+/// `reported_clipboard_sequence`. The swap makes the first of several windows the reporter.
+fn noteClipboardSequence(sequence: u32) bool {
+    const previous = reported_clipboard_sequence.swap(sequence, .monotonic);
+    return previous != sequence;
+}
+
+test "noteClipboardSequence reports each sequence number once" {
+    reported_clipboard_sequence.store(0, .monotonic);
+    try testing.expect(noteClipboardSequence(7));
+    try testing.expect(!noteClipboardSequence(7));
+    try testing.expect(noteClipboardSequence(8));
+    // A copy of our own records its number first, so its update is not reported.
+    reported_clipboard_sequence.store(9, .monotonic);
+    try testing.expect(!noteClipboardSequence(9));
 }
 
 // Message codes windowz does not name; MessageType is non-exhaustive.
@@ -1014,6 +1061,9 @@ test "clipboard entry points compile" {
     if (builtin.os.tag == .windows) {
         _ = &Window.setClipboardText;
         _ = &Window.getClipboardText;
+        _ = &Window.setPrimaryText;
+        _ = &Window.getPrimaryText;
+        _ = &windowProc;
     }
 }
 

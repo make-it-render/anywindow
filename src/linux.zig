@@ -173,6 +173,22 @@ pub const Window = union(enum) {
         }
     }
 
+    /// Put `text` on the primary selection, the one middle-click pastes, and serve it until
+    /// another client selects something.
+    pub fn setPrimaryText(self: *@This(), text: []const u8) !void {
+        switch (self.*) {
+            inline else => |*window| return window.setPrimaryText(text),
+        }
+    }
+
+    /// The primary selection's text as UTF-8, owned by the caller; the same contract as
+    /// `getClipboardText`.
+    pub fn getPrimaryText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
+        switch (self.*) {
+            inline else => |*window| return window.getPrimaryText(allocator),
+        }
+    }
+
     pub fn beginDraw(self: *@This()) !void {
         switch (self.*) {
             inline else => |*window| return window.beginDraw(),
