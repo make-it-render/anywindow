@@ -60,7 +60,10 @@ test "receiveIo blocked read is interrupted by io cancelation" {
     group.cancel(testing.io);
 }
 
-pub const x11 = @import("x11.zig");
+pub const x11 = switch (builtin.os.tag) {
+    .linux => @import("x11.zig"),
+    else => struct {},
+};
 pub const win32 = @import("win32.zig");
 pub const linux = switch (builtin.os.tag) {
     .linux => @import("linux.zig"),
