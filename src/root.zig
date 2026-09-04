@@ -12,6 +12,7 @@ pub const wayland = switch (builtin.os.tag) {
 pub const queue = @import("queue.zig");
 pub const keys = @import("keys.zig");
 pub const any = @import("any.zig");
+pub const uri_list = @import("uri_list.zig");
 
 pub const WindowID = common.WindowID;
 pub const Size = common.Size;
@@ -30,6 +31,12 @@ pub const Cursor = common.Cursor;
 pub const WindowOptions = common.WindowOptions;
 pub const WindowStatus = common.WindowStatus;
 pub const Event = common.Event;
+pub const DropKinds = common.DropKinds;
+pub const DropKind = common.DropKind;
+pub const DropData = common.DropData;
+pub const DragData = common.DragData;
+pub const DropError = common.DropError;
+pub const DragError = common.DragError;
 
 pub const WindowManager = any.WindowManager;
 pub const Image = any.Image;
@@ -47,8 +54,12 @@ test {
     _ = win32;
     _ = keys;
     _ = any;
+    _ = uri_list;
+    _ = @import("win32_drag.zig");
     if (builtin.os.tag == .linux) {
         _ = x11;
         _ = wayland;
+        _ = @import("x11_drag.zig");
+        _ = @import("wayland_drag.zig");
     }
 }

@@ -45,8 +45,8 @@ pub const WindowManager = struct {
     xfixes: ?x11.Extension,
 
     // Selection state, guarded by clipboard_mutex: callers and the reader task both touch it.
-    /// CLIPBOARD and PRIMARY, indexed by `common.Selection`: the text we serve while one of our
-    /// windows owns each, and that window.
+    /// CLIPBOARD, PRIMARY and XdndSelection, indexed by `SelectionIndex`: the payload we serve
+    /// while one of our windows owns each, and that window.
     selections: [selection_count]OwnedSelection,
     /// The paste in flight; see `paste`. The reader task matches a SelectionNotify against the
     /// requestor, and delivers into the generation it matched, so a fetch started for a paste
@@ -70,6 +70,25 @@ pub const WindowManager = struct {
     /// INCR transfers we are sending, each on a connection of its own; reaped as they finish,
     /// canceled in deinit. Reader task only.
     incr_sends: std.ArrayList(*IncrSend) = .empty,
+
+    // Drag and drop; the state machines are described in x11_drag.zig.
+    /// The kinds each window takes, written by `setDropTarget`. Under clipboard_mutex.
+    drop_kinds: std.AutoHashMapUnmanaged(common.WindowID, common.DropKinds) = .empty,
+    /// The drag over one of our windows. Reader task only.
+    drop_target: ?x11_drag.DropTarget = null,
+    /// The newest drop's payload until `takeDrop` moves it out. Under clipboard_mutex.
+    pending_drop: ?common.DropData = null,
+    /// Whether a drag of ours runs, from `startDrag` until `drag_finished`. Under clipboard_mutex.
+    drag_active: bool = false,
+    /// The drag `startDrag` set up, until the reader task takes it on the start message. Under clipboard_mutex.
+    drag_request: ?x11_drag.DragSource = null,
+    /// The running drag of ours. Reader task only.
+    drag_source: ?x11_drag.DragSource = null,
+    /// Timed waits on a silent peer, each on a connection of its own; reaped as they finish,
+    /// canceled in deinit. Reader task only.
+    drag_timers: std.ArrayList(*x11_drag.Timer) = .empty,
+    /// Ties a timer's message to the wait that started it. Reader task only.
+    timer_generation: u32 = 0,
 
     keysym_map: []u32,
     keysyms_per_keycode: u8,
@@ -110,6 +129,22 @@ pub const WindowManager = struct {
             .text = try x11.internAtom(io, conn, "TEXT"),
             .incr = try x11.internAtom(io, conn, "INCR"),
             .mir_clipboard = try x11.internAtom(io, conn, "MIR_CLIPBOARD"),
+            .xdnd_aware = try x11.internAtom(io, conn, x11.xdnd.Atom.aware),
+            .xdnd_selection = try x11.internAtom(io, conn, x11.xdnd.Atom.selection),
+            .xdnd_enter = try x11.internAtom(io, conn, x11.xdnd.Atom.enter),
+            .xdnd_position = try x11.internAtom(io, conn, x11.xdnd.Atom.position),
+            .xdnd_status = try x11.internAtom(io, conn, x11.xdnd.Atom.status),
+            .xdnd_leave = try x11.internAtom(io, conn, x11.xdnd.Atom.leave),
+            .xdnd_drop = try x11.internAtom(io, conn, x11.xdnd.Atom.drop),
+            .xdnd_finished = try x11.internAtom(io, conn, x11.xdnd.Atom.finished),
+            .xdnd_type_list = try x11.internAtom(io, conn, x11.xdnd.Atom.type_list),
+            .xdnd_proxy = try x11.internAtom(io, conn, x11.xdnd.Atom.proxy),
+            .xdnd_action_copy = try x11.internAtom(io, conn, x11.xdnd.Atom.action_copy),
+            .mime_uri_list = try x11.internAtom(io, conn, "text/uri-list"),
+            .mime_utf8 = try x11.internAtom(io, conn, "text/plain;charset=utf-8"),
+            .mime_text_plain = try x11.internAtom(io, conn, "text/plain"),
+            .mir_drop = try x11.internAtom(io, conn, "MIR_DROP"),
+            .mir_drag_control = try x11.internAtom(io, conn, "MIR_DRAG_CONTROL"),
         };
 
         const clipboard_conn = openClipboardConnection(io, environ, allocator);
@@ -214,6 +249,7 @@ pub const WindowManager = struct {
             .selections = .{
                 .{ .atom = atoms.clipboard },
                 .{ .atom = atoms.primary },
+                .{ .atom = atoms.xdnd_selection },
             },
 
             .scaling = scaling,
@@ -251,10 +287,16 @@ pub const WindowManager = struct {
         self.in_flight.deinit(self.allocator);
         self.reapIncrSends(.cancel);
         self.incr_sends.deinit(self.allocator);
+        self.reapTimers(.cancel);
+        self.drag_timers.deinit(self.allocator);
+        if (self.drag_source) |drag| self.releasePointerGrab(drag.grab);
+        if (self.drag_request) |drag| self.releasePointerGrab(drag.grab);
         if (self.incr_paste) |*incr| incr.data.deinit(self.allocator);
         for (&self.selections) |*selection| {
-            if (selection.text) |text| self.allocator.free(text);
+            if (selection.payload) |payload| payload.deinit(self.allocator);
         }
+        if (self.pending_drop) |drop| drop.deinit(self.allocator);
+        self.drop_kinds.deinit(self.allocator);
         if (self.paste_result) |text| self.allocator.free(text);
         if (self.clipboard_conn) |clipboard| clipboard.close(self.io);
         self.conn.close(self.io);
@@ -311,22 +353,20 @@ pub const WindowManager = struct {
                     if (self.selectionOf(clear.selection)) |which| self.dropSelection(io, clear.owner, which);
                     break :blk common.Event{ .nop = {} };
                 },
-                .SelectionNotify => |notify| blk: {
+                // A drop's payload arrives the way a paste does; the selection says which it is.
+                .SelectionNotify => |notify| if (notify.selection == self.atoms.xdnd_selection) self.finishDrop(io, notify) else blk: {
                     self.finishPaste(io, notify);
                     break :blk common.Event{ .nop = {} };
                 },
                 // An INCR owner announces each chunk with a property change on our window.
-                .PropertyNotify => |notify| blk: {
-                    self.continueIncrPaste(io, notify);
-                    break :blk common.Event{ .nop = {} };
-                },
+                .PropertyNotify => |notify| self.continueIncrPaste(io, notify),
                 // Nothing waits for replies on this connection once the loop owns it (GrabPointer's
                 // is the one that arrives); drain the trailing data so the stream stays aligned.
                 .Reply => |reply| blk: {
                     try skipBytes(io, self.conn, reply.extraLength());
                     break :blk common.Event{ .nop = {} };
                 },
-                else => self.mapMessage(message),
+                else => self.mapMessage(io, message),
             };
             switch (event) {
                 .nop => {}, // ignored message — keep reading
@@ -351,7 +391,7 @@ pub const WindowManager = struct {
             if (isAutoRepeatPair(release, next)) return self.mapKeyPress(next.KeyPress, true);
             self.held_message = next;
         }
-        return self.mapMessage(.{ .KeyRelease = release });
+        return self.mapMessage(io, .{ .KeyRelease = release });
     }
 
     fn mapKeyPress(self: *@This(), key_press: x11.proto.KeyPress, repeat: bool) common.Event {
@@ -386,7 +426,7 @@ pub const WindowManager = struct {
     }
 
     /// Map a raw X11 message to a `common.Event` (`.nop` for messages we ignore).
-    fn mapMessage(self: *@This(), message: x11.Message) common.Event {
+    fn mapMessage(self: *@This(), io: std.Io, message: x11.Message) common.Event {
         {
             switch (message) {
                 .Expose => |expose| {
@@ -403,9 +443,41 @@ pub const WindowManager = struct {
                     };
                 },
                 .ClientMessage => |client_message| {
-                    const client_message_data = x11.clientMessageData(client_message);
-                    if (client_message_data.u32[0] == self.atoms.wm_delete_window) {
-                        return .{ .close = client_message.window_id };
+                    // Another client may send any format; only the five-long ones are ours to read.
+                    if (client_message.format != 32) return .{ .nop = {} };
+                    const data = x11.clientMessageData(client_message).u32;
+                    const atoms = self.atoms;
+                    const message_type = client_message.data_Type;
+                    const window = client_message.window_id;
+                    if (message_type == atoms.wm_protocols) {
+                        if (data[0] == atoms.wm_delete_window) return .{ .close = window };
+                    } else if (message_type == atoms.xdnd_enter) {
+                        return self.xdndEnter(io, window, x11.xdnd.Enter.unpack(data));
+                    } else if (message_type == atoms.xdnd_position) {
+                        return self.xdndPosition(io, window, x11.xdnd.Position.unpack(data));
+                    } else if (message_type == atoms.xdnd_leave) {
+                        return self.xdndLeave(window, x11.xdnd.Leave.unpack(data));
+                    } else if (message_type == atoms.xdnd_drop) {
+                        return self.xdndDrop(io, window, x11.xdnd.Drop.unpack(data));
+                    } else if (message_type == atoms.xdnd_status) {
+                        return self.dragStatus(io, window, x11.xdnd.Status.unpack(data));
+                    } else if (message_type == atoms.xdnd_finished) {
+                        return self.dragFinished(io, window, x11.xdnd.Finished.unpack(data));
+                    } else if (message_type == atoms.mir_drag_control) {
+                        return self.dragControl(io, window, @enumFromInt(data[0]), data[1]);
+                    }
+                    return .{ .nop = {} };
+                },
+                // Our own window going away ends whatever drag it was part of.
+                .DestroyNotify => |destroyed| {
+                    if (self.drop_target) |target| {
+                        if (target.window == destroyed.window_id) {
+                            self.abandonDropIncr();
+                            self.drop_target = null;
+                        }
+                    }
+                    if (self.drag_source) |drag| {
+                        if (drag.window == destroyed.window_id) return self.finishDrag(io, false);
                     }
                     return .{ .nop = {} };
                 },
@@ -424,7 +496,13 @@ pub const WindowManager = struct {
                         },
                     };
                 },
-                .KeyPress => |key_press| return self.mapKeyPress(key_press, false),
+                .KeyPress => |key_press| {
+                    // Escape cancels a drag of ours; the key never reaches the application.
+                    if (self.drag_source != null and self.lookupKeysym(key_press.keycode, key_press.state) == keysym_escape) {
+                        return self.cancelDrag(io);
+                    }
+                    return self.mapKeyPress(key_press, false);
+                },
                 // Grab-driven focus changes (a window manager's alt-tab popup
                 // taking the keyboard) are transient and not reported.
                 .FocusIn => |focus| {
@@ -437,6 +515,10 @@ pub const WindowManager = struct {
                     return .{ .focus_out = focus.event };
                 },
                 .ButtonRelease => |button_release| {
+                    // During a drag of ours the grab task forwards the release here; it ends the drag.
+                    if (self.drag_source) |drag| {
+                        if (drag.window == button_release.event_window) return self.dragRelease(io, button_release.time);
+                    }
                     switch (button_release.keycode) {
                         4, 5, 6, 7 => return .{ .nop = {} },
                         else => return .{
@@ -498,6 +580,12 @@ pub const WindowManager = struct {
                     }
                 },
                 .MotionNotify => |motion_notify| {
+                    // During a drag of ours the pointer is grabbed and every motion is the drag's.
+                    if (self.drag_source) |drag| {
+                        if (drag.window == motion_notify.event_window) {
+                            return self.dragMotion(io, .{ .root_x = motion_notify.root_x, .root_y = motion_notify.root_y, .time = motion_notify.time });
+                        }
+                    }
                     return .{
                         .mouse_moved = .{
                             .x = motion_notify.event_x,
@@ -507,6 +595,10 @@ pub const WindowManager = struct {
                     };
                 },
                 .ConfigureNotify => |configure| {
+                    // The window moved or resized: its root origin, which drag positions are converted with, is read again at the next position.
+                    if (self.drop_target) |*target| {
+                        if (target.window == configure.window_id) target.origin_valid = false;
+                    }
                     return .{
                         .resize = .{
                             .width = configure.width,
@@ -589,12 +681,12 @@ pub const WindowManager = struct {
     }
 
     /// The state of one selection.
-    fn stateOf(self: *@This(), which: common.Selection) *OwnedSelection {
+    fn stateOf(self: *@This(), which: SelectionIndex) *OwnedSelection {
         return &self.selections[@intFromEnum(which)];
     }
 
     /// Which selection `atom` names, if one we handle.
-    fn selectionOf(self: *const @This(), atom: u32) ?common.Selection {
+    fn selectionOf(self: *const @This(), atom: u32) ?SelectionIndex {
         for (self.selections, 0..) |owned, index| {
             if (owned.atom == atom) return @enumFromInt(index);
         }
@@ -612,9 +704,9 @@ pub const WindowManager = struct {
         {
             self.clipboard_mutex.lockUncancelable(self.io);
             defer self.clipboard_mutex.unlock(self.io);
-            const owned = self.stateOf(which);
-            if (owned.text) |old| self.allocator.free(old);
-            owned.text = copied;
+            const owned = self.stateOf(SelectionIndex.of(which));
+            if (owned.payload) |old| old.deinit(self.allocator);
+            owned.payload = .{ .bytes = copied, .kind = .text };
             owned.owner = owner;
         }
 
@@ -624,20 +716,20 @@ pub const WindowManager = struct {
         // we do not. CurrentTime always takes.
         try x11.send(self.io, self.conn, x11.proto.SetSelectionOwner{
             .owner = owner,
-            .selection = self.stateOf(which).atom,
+            .selection = self.stateOf(SelectionIndex.of(which)).atom,
         });
     }
 
-    /// Forget the text we were serving for `which`. `owner` limits it to a loss by that
+    /// Forget the payload we were serving for `which`. `owner` limits it to a loss by that
     /// window: a SelectionClear for a window that already gave the selection up, or a window
     /// being destroyed while another one owns it, must not drop the live text.
-    fn dropSelection(self: *@This(), io: std.Io, owner: u32, which: common.Selection) void {
+    fn dropSelection(self: *@This(), io: std.Io, owner: u32, which: SelectionIndex) void {
         self.clipboard_mutex.lockUncancelable(io);
         defer self.clipboard_mutex.unlock(io);
         const owned = self.stateOf(which);
         if (owned.owner != owner) return;
-        if (owned.text) |text| self.allocator.free(text);
-        owned.text = null;
+        if (owned.payload) |payload| payload.deinit(self.allocator);
+        owned.payload = null;
         owned.owner = 0;
     }
 
@@ -666,7 +758,7 @@ pub const WindowManager = struct {
         // SelectionClear the reader task may not have seen yet, so the owner on record lags the
         // truth by a moment. Asking the server costs one round trip through our own serving path.
         // UTF8_STRING first; owners from before it refuse, and are asked for STRING instead.
-        const atom = self.stateOf(which).atom;
+        const atom = self.stateOf(SelectionIndex.of(which)).atom;
         return self.convertSelection(allocator, requestor, atom, self.atoms.utf8_string) catch |err| switch (err) {
             error.ClipboardEmpty => self.convertSelection(allocator, requestor, atom, self.atoms.string),
             else => err,
@@ -748,35 +840,36 @@ pub const WindowManager = struct {
     /// request is handed to an `IncrSend` task, which answers the request itself.
     fn serveSelection(self: *@This(), io: std.Io, request: x11.proto.SelectionRequest) !void {
         // A copy, so the lock is not held while writing to the socket.
-        const served: ?[]u8 = blk: {
+        const served: ?x11_drag.Payload = blk: {
             self.clipboard_mutex.lockUncancelable(io);
             defer self.clipboard_mutex.unlock(io);
             const which = self.selectionOf(request.selection) orelse break :blk null;
             const owned = self.stateOf(which);
             if (owned.owner == 0) break :blk null;
-            break :blk try self.allocator.dupe(u8, owned.text orelse "");
+            const payload = owned.payload orelse break :blk null;
+            break :blk .{ .bytes = try self.allocator.dupe(u8, payload.bytes), .kind = payload.kind };
         };
         var served_owned = served != null;
-        defer if (served_owned) self.allocator.free(served.?);
+        defer if (served_owned) served.?.deinit(self.allocator);
 
         // Pre-ICCCM requestors pass no property; the target names it then.
         var property: u32 = if (request.property != 0) request.property else request.target;
         const atoms = self.atoms;
-        if (served) |text| {
+        if (served) |payload| {
             if (request.target == atoms.targets) {
-                // The text types only; TIMESTAMP and MULTIPLE are left out, as SDL leaves them.
-                const list = [_]u32{ atoms.targets, atoms.utf8_string, atoms.text, atoms.string };
+                var buffer: [7]u32 = undefined;
+                const list = x11_drag.targetList(payload.kind, self.typeAtoms(), &buffer);
                 _ = try self.sendClipboard(io, x11.proto.ChangeProperty{
                     .window_id = request.requestor,
                     .property = property,
                     .property_type = atoms.atom,
                     .format = 32,
-                    .length_of_data = list.len,
-                }, std.mem.sliceAsBytes(&list));
-            } else if (request.target == atoms.utf8_string or request.target == atoms.text or request.target == atoms.string) {
-                // TEXT asks for whichever text type we like. STRING is Latin-1 by the book, but
-                // every toolkit answers it with the UTF-8 bytes, and so do we.
-                const property_type = if (request.target == atoms.text) atoms.utf8_string else request.target;
+                    .length_of_data = @intCast(list.len),
+                }, std.mem.sliceAsBytes(list));
+            } else if (x11_drag.servedType(payload.kind, request.target, self.typeAtoms())) |property_type| {
+                // STRING is Latin-1 by the book, but every toolkit answers it with the UTF-8
+                // bytes, and so do we.
+                const text = payload.bytes;
                 if (text.len > maxPropertyBytes(self.info)) {
                     if (self.startIncrSend(io, request, property, property_type, text)) {
                         served_owned = false; // the task owns the text now
@@ -894,11 +987,12 @@ pub const WindowManager = struct {
     /// to come; deleting it tells the owner to start, and the chunks arrive through
     /// `continueIncrPaste`, so this returns null and leaves `incr_paste` waiting for them.
     fn fetchPasteProperty(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify, generation: u32) !?PasteOutcome {
-        var property = try self.readProperty(io, notify.requestor, notify.property);
+        var property = try self.readProperty(io, notify.requestor, notify.property, true);
         defer property.value.deinit(self.allocator);
 
         if (property.property_type == self.atoms.incr) {
             self.incr_paste = .{
+                .kind = .paste,
                 .generation = generation,
                 .requestor = notify.requestor,
                 .property = notify.property,
@@ -915,39 +1009,61 @@ pub const WindowManager = struct {
         return .{ .text = text };
     }
 
-    /// An INCR owner wrote the next chunk into the paste property (or the empty one that ends
-    /// the transfer). Runs on the reader task.
-    fn continueIncrPaste(self: *@This(), io: std.Io, notify: x11.proto.PropertyNotify) void {
-        if (self.incr_paste == null) return;
+    /// An INCR owner wrote the next chunk into the paste (or drop) property, or the empty one
+    /// that ends the transfer. Runs on the reader task; a completed drop is the event.
+    fn continueIncrPaste(self: *@This(), io: std.Io, notify: x11.proto.PropertyNotify) common.Event {
+        if (self.incr_paste == null) return .{ .nop = {} };
         const incr = &self.incr_paste.?;
-        if (notify.window_id != incr.requestor or notify.atom != incr.property or notify.state != .NewValue) return;
+        if (notify.window_id != incr.requestor or notify.atom != incr.property or notify.state != .NewValue) return .{ .nop = {} };
         const generation = incr.generation;
 
-        const stale = blk: {
-            self.clipboard_mutex.lockUncancelable(io);
-            defer self.clipboard_mutex.unlock(io);
-            if (!self.paste_pending or self.paste_generation != generation) break :blk true;
-            self.paste_progress +%= 1;
-            break :blk false;
+        const stale = switch (incr.kind) {
+            .paste => blk: {
+                self.clipboard_mutex.lockUncancelable(io);
+                defer self.clipboard_mutex.unlock(io);
+                if (!self.paste_pending or self.paste_generation != generation) break :blk true;
+                self.paste_progress +%= 1;
+                break :blk false;
+            },
+            .drop => blk: {
+                const target = &(self.drop_target orelse break :blk true);
+                if (!target.awaiting_drop or target.timer_generation != generation) break :blk true;
+                target.progress +%= 1;
+                break :blk false;
+            },
         };
         if (stale) {
             // The caller gave up; the owner will stop once we stop deleting the property.
             self.dropIncrPaste();
-            return;
+            return .{ .nop = {} };
         }
 
         const collected = self.collectIncrChunk(io, incr) catch |err| blk: {
             log.warn("Failed to collect an INCR chunk: {any}", .{err});
             break :blk PasteOutcome{ .failure = error.ClipboardEmpty };
         };
-        const outcome = collected orelse return; // more chunks to come
+        const outcome = collected orelse return .{ .nop = {} }; // more chunks to come
+        const kind = incr.kind;
         self.dropIncrPaste();
-        self.deliverPaste(io, generation, outcome);
+        switch (kind) {
+            .paste => {
+                self.deliverPaste(io, generation, outcome);
+                return .{ .nop = {} };
+            },
+            .drop => switch (outcome) {
+                .text => |bytes| {
+                    defer self.allocator.free(bytes);
+                    const data = self.decodeDrop(self.drop_target.?.chosen.?.kind, bytes) catch null;
+                    return self.settleDrop(io, data);
+                },
+                .failure => return self.settleDrop(io, null),
+            },
+        }
     }
 
     /// Read the chunk the owner just wrote and append it; the empty chunk completes the text.
     fn collectIncrChunk(self: *@This(), io: std.Io, incr: *IncrPaste) !?PasteOutcome {
-        var chunk = try self.readProperty(io, incr.requestor, incr.property);
+        var chunk = try self.readProperty(io, incr.requestor, incr.property, true);
         defer chunk.value.deinit(self.allocator);
         if (chunk.value.items.len == 0) {
             const text = if (incr.string)
@@ -974,10 +1090,11 @@ pub const WindowManager = struct {
     };
 
     /// GetProperty on `clipboard_conn`, the only connection a reply can be read on once the
-    /// loop owns `conn`, in `property_read_bytes` pieces until the server has no more. The
-    /// property is deleted with the last piece: that is how a requestor tells an INCR owner it
-    /// is ready for the next chunk, and every other owner just sees its property cleaned up.
-    fn readProperty(self: *@This(), io: std.Io, window: u32, property: u32) !Property {
+    /// loop owns `conn`, in `property_read_bytes` pieces until the server has no more. With
+    /// `delete` the property goes with the last piece: that is how a requestor tells an INCR
+    /// owner it is ready for the next chunk, and every other owner just sees its property
+    /// cleaned up. Another client's properties (a drag source's type list) are read intact.
+    fn readProperty(self: *@This(), io: std.Io, window: u32, property: u32, delete: bool) !Property {
         const conn = self.clipboard_conn orelse return error.ClipboardUnsupported;
         var result: Property = .{ .property_type = 0, .format = 0, .value = .empty };
         errdefer result.value.deinit(self.allocator);
@@ -990,7 +1107,7 @@ pub const WindowManager = struct {
                 .property_type = 0, // AnyPropertyType
                 .long_offset = offset_units,
                 .long_length = property_read_bytes / 4,
-                .delete = true,
+                .delete = delete,
             }, null);
             const reply = try self.readClipboardReply(io, sequence);
             const header = reply.as(x11.proto.GetPropertyReply);
@@ -1047,7 +1164,657 @@ pub const WindowManager = struct {
         self.paste_pending = false;
         self.paste_ready.set(io);
     }
+
+    // Drag and drop. Both state machines run on the reader task and send every XDND message
+    // on the side connection, so the main one keeps its single writer; callers only set
+    // properties, claim the selection and hand a drag over. See x11_drag.zig.
+
+    fn typeAtoms(self: *const @This()) x11_drag.TypeAtoms {
+        return .{
+            .targets = self.atoms.targets,
+            .uri_list = self.atoms.mime_uri_list,
+            .mime_utf8 = self.atoms.mime_utf8,
+            .utf8_string = self.atoms.utf8_string,
+            .mime_text_plain = self.atoms.mime_text_plain,
+            .text = self.atoms.text,
+            .string = self.atoms.string,
+        };
+    }
+
+    /// Take drops of `kinds` on `window`: XdndAware on the window is what sources look for
+    /// when they walk down from the root, and the kinds decide what is accepted.
+    pub fn setDropTarget(self: *@This(), window: u32, kinds: common.DropKinds) common.DragError!void {
+        if (self.clipboard_conn == null) return error.DragUnsupported;
+        {
+            self.clipboard_mutex.lockUncancelable(self.io);
+            defer self.clipboard_mutex.unlock(self.io);
+            if (kinds.any()) {
+                self.drop_kinds.put(self.allocator, window, kinds) catch return error.OutOfMemory;
+            } else {
+                _ = self.drop_kinds.remove(window);
+            }
+        }
+        if (kinds.any()) {
+            const version: u32 = x11.xdnd.version;
+            x11.sendWithBytes(self.io, self.conn, x11.proto.ChangeProperty{
+                .window_id = window,
+                .property = self.atoms.xdnd_aware,
+                .property_type = self.atoms.atom,
+                .format = 32,
+                .length_of_data = 1,
+            }, std.mem.asBytes(&version)) catch return error.DragUnsupported;
+        } else {
+            x11.send(self.io, self.conn, x11.proto.DeleteProperty{
+                .window_id = window,
+                .property = self.atoms.xdnd_aware,
+            }) catch return error.DragUnsupported;
+        }
+    }
+
+    /// The newest drop's payload, copied into `allocator`; the stored one is freed.
+    pub fn takeDrop(self: *@This(), allocator: std.mem.Allocator) (common.DropError || std.mem.Allocator.Error)!common.DropData {
+        self.clipboard_mutex.lockUncancelable(self.io);
+        defer self.clipboard_mutex.unlock(self.io);
+        const stored = self.pending_drop orelse return error.NoDrop;
+        self.pending_drop = null;
+        defer stored.deinit(self.allocator);
+        return stored.dupe(allocator);
+    }
+
+    fn dropKindsOf(self: *@This(), window: u32) common.DropKinds {
+        self.clipboard_mutex.lockUncancelable(self.io);
+        defer self.clipboard_mutex.unlock(self.io);
+        return self.drop_kinds.get(window) orelse .{};
+    }
+
+    /// Start a drag of `data` from `window`, on the caller's thread: claim XdndSelection with
+    /// the payload, publish the type list, hand the drag to the reader task with a control
+    /// message on the main connection, and start the task that grabs the pointer. Everything
+    /// after that happens on the reader task and ends in `drag_finished`.
+    pub fn startDrag(self: *@This(), window: u32, data: common.DragData) common.DragError!void {
+        if (self.clipboard_conn == null) return error.DragUnsupported;
+        const kind: common.DropKind = data;
+        const bytes: []u8 = switch (data) {
+            .text => |text| self.allocator.dupe(u8, text),
+            .files => |paths| uri_list.format(self.allocator, paths),
+        } catch return error.OutOfMemory;
+        var bytes_owned = true;
+        defer if (bytes_owned) self.allocator.free(bytes);
+        if (bytes.len > std.math.maxInt(u32)) return error.DragUnsupported;
+
+        var types_buffer: [6]u32 = undefined;
+        const types = x11_drag.offeredTypes(kind, self.typeAtoms(), &types_buffer);
+        var request: x11_drag.DragSource = .{ .window = window, .kind = kind, .types = .{0} ** 6, .type_count = @intCast(types.len), .grab = null };
+        @memcpy(request.types[0..types.len], types);
+        {
+            self.clipboard_mutex.lockUncancelable(self.io);
+            defer self.clipboard_mutex.unlock(self.io);
+            if (self.drag_active) return error.DragInProgress;
+            self.drag_active = true;
+            const owned = self.stateOf(.drag);
+            if (owned.payload) |old| old.deinit(self.allocator);
+            owned.payload = .{ .bytes = bytes, .kind = kind };
+            owned.owner = window;
+            bytes_owned = false;
+            self.drag_request = request;
+        }
+        errdefer self.abandonDrag(window);
+
+        const grab = self.allocator.create(x11_drag.PointerGrab) catch return error.OutOfMemory;
+        grab.* = .{ .environ = self.environ, .allocator = self.allocator, .window = window, .control_atom = self.atoms.mir_drag_control };
+        grab.future = self.io.concurrent(x11_drag.PointerGrab.run, .{ grab, self.io }) catch |err| {
+            log.warn("Pointer grab task unavailable ({any}); no drag", .{err});
+            self.allocator.destroy(grab);
+            return error.DragUnsupported;
+        };
+        {
+            // The reader task cannot have taken the request yet: the start message goes out below.
+            self.clipboard_mutex.lockUncancelable(self.io);
+            defer self.clipboard_mutex.unlock(self.io);
+            self.drag_request.?.grab = grab;
+        }
+
+        // CurrentTime, as the clipboard claims.
+        x11.send(self.io, self.conn, x11.proto.SetSelectionOwner{
+            .owner = window,
+            .selection = self.atoms.xdnd_selection,
+        }) catch return error.DragUnsupported;
+        x11.sendWithBytes(self.io, self.conn, x11.proto.ChangeProperty{
+            .window_id = window,
+            .property = self.atoms.xdnd_type_list,
+            .property_type = self.atoms.atom,
+            .format = 32,
+            .length_of_data = @intCast(types.len),
+        }, std.mem.sliceAsBytes(types)) catch return error.DragUnsupported;
+        x11_drag.sendControl(self.io, self.conn, window, self.atoms.mir_drag_control, .started, 0) catch return error.DragUnsupported;
+    }
+
+    /// Undo a `startDrag` that failed partway, on the caller's thread.
+    fn abandonDrag(self: *@This(), window: u32) void {
+        const request = blk: {
+            self.clipboard_mutex.lockUncancelable(self.io);
+            defer self.clipboard_mutex.unlock(self.io);
+            self.drag_active = false;
+            const owned = self.stateOf(.drag);
+            if (owned.owner == window) {
+                if (owned.payload) |payload| payload.deinit(self.allocator);
+                owned.payload = null;
+                owned.owner = 0;
+            }
+            const request = self.drag_request;
+            self.drag_request = null;
+            break :blk request;
+        };
+        if (request) |taken| self.releasePointerGrab(taken.grab);
+        x11.send(self.io, self.conn, x11.proto.SetSelectionOwner{ .owner = 0, .selection = self.atoms.xdnd_selection }) catch {};
+    }
+
+    /// End the grab task (which drops its connection, and with it the grab) and free it.
+    fn releasePointerGrab(self: *@This(), task: ?*x11_drag.PointerGrab) void {
+        const grab = task orelse return;
+        if (grab.future) |*future| future.cancel(self.io);
+        self.allocator.destroy(grab);
+    }
+
+    /// Send an XDND ClientMessage to `destination` from the side connection; with an empty mask
+    /// it reaches the client that created the window, whoever that is.
+    fn sendXdnd(self: *@This(), io: std.Io, destination: u32, message_type: u32, data: [5]u32) void {
+        const event = x11.proto.ClientMessageEvent{ .window_id = destination, .message_type = message_type, .data = data };
+        _ = self.sendClipboard(io, x11.proto.SendEvent{
+            .destination = destination,
+            .event_mask = 0,
+            .event = std.mem.toBytes(event),
+        }, null) catch |err| log.warn("Failed to send an XDND message: {any}", .{err});
+    }
+
+    /// TranslateCoordinates on the side connection.
+    fn translate(self: *@This(), io: std.Io, source_window: u32, destination_window: u32, x: i16, y: i16) !x11.proto.TranslateCoordinatesReply {
+        const sequence = try self.sendClipboard(io, x11.proto.TranslateCoordinates{ .src_window = source_window, .dst_window = destination_window, .src_x = x, .src_y = y }, null);
+        const reply = try self.readClipboardReply(io, sequence);
+        return reply.as(x11.proto.TranslateCoordinatesReply);
+    }
+
+    /// The first long of a 32-bit property on another client's window, or null when it has none
+    /// (or the window is gone).
+    fn readWindowProperty(self: *@This(), io: std.Io, window: u32, atom: u32) ?u32 {
+        var property = self.readProperty(io, window, atom, false) catch return null;
+        defer property.value.deinit(self.allocator);
+        if (property.property_type == 0 or property.format != 32 or property.value.items.len < 4) return null;
+        return std.mem.readInt(u32, property.value.items[0..4], native_endian);
+    }
+
+    /// A source's XdndTypeList, owned by the caller; null when it has none readable.
+    fn readTypeList(self: *@This(), io: std.Io, source: u32) ?[]u32 {
+        var property = self.readProperty(io, source, self.atoms.xdnd_type_list, false) catch |err| {
+            log.debug("XdndTypeList of window 0x{x} could not be read: {any}", .{ source, err });
+            return null;
+        };
+        defer property.value.deinit(self.allocator);
+        if (property.property_type != self.atoms.atom or property.format != 32) return null;
+        return atomsFromBytes(self.allocator, property.value.items) catch null;
+    }
+
+    /// Start a `Timer` that reports to `window` after `duration`; the generation it will carry.
+    /// Reader task only.
+    fn startTimer(self: *@This(), io: std.Io, window: u32, duration: std.Io.Duration) u32 {
+        self.reapTimers(.finished);
+        self.timer_generation +%= 1;
+        const generation = self.timer_generation;
+        const task = self.allocator.create(x11_drag.Timer) catch return generation;
+        task.* = .{
+            .environ = self.environ,
+            .allocator = self.allocator,
+            .window = window,
+            .control_atom = self.atoms.mir_drag_control,
+            .generation = generation,
+            .duration = duration,
+        };
+        task.future = io.concurrent(x11_drag.Timer.run, .{ task, io }) catch |err| {
+            log.warn("Drag timer task unavailable ({any}); this wait has no deadline", .{err});
+            self.allocator.destroy(task);
+            return generation;
+        };
+        self.drag_timers.append(self.allocator, task) catch {
+            task.future.?.cancel(io);
+            self.allocator.destroy(task);
+        };
+        return generation;
+    }
+
+    /// Retire timer tasks: the finished ones, or all of them (canceling the rest) at deinit.
+    fn reapTimers(self: *@This(), which: enum { finished, cancel }) void {
+        var index = self.drag_timers.items.len;
+        while (index > 0) {
+            index -= 1;
+            const task = self.drag_timers.items[index];
+            switch (which) {
+                .finished => if (!task.done.load(.acquire)) continue,
+                .cancel => {},
+            }
+            if (task.future) |*future| {
+                switch (which) {
+                    .finished => future.await(self.io),
+                    .cancel => future.cancel(self.io),
+                }
+            }
+            _ = self.drag_timers.swapRemove(index);
+            self.allocator.destroy(task);
+        }
+    }
+
+    /// Forget an INCR transfer that was a drop's; a paste's is left alone.
+    fn abandonDropIncr(self: *@This()) void {
+        const incr = self.incr_paste orelse return;
+        if (incr.kind == .drop) self.dropIncrPaste();
+    }
+
+    // The drop target: a drag from another client (or our own) over one of our windows.
+
+    /// XdndEnter: rank what the source offers against what the window takes. Nothing is
+    /// emitted yet; the first position carries the pointer and becomes `drag_enter`.
+    fn xdndEnter(self: *@This(), io: std.Io, window: u32, enter: x11.xdnd.Enter) common.Event {
+        // Before version 3 there is no type list and no action.
+        if (enter.version < 3) return .{ .nop = {} };
+        // A drag already over one of our windows ends there first: its XdndLeave never came.
+        if (self.drop_target) |old| {
+            if (old.entered) self.queued.push(.{ .drag_leave = old.window });
+            self.abandonDropIncr();
+        }
+        var target: x11_drag.DropTarget = .{
+            .source = enter.source,
+            .version = @min(x11.xdnd.version, enter.version),
+            .window = window,
+            .chosen = null,
+        };
+        const kinds = self.dropKindsOf(window);
+        if (kinds.any()) {
+            const atoms = self.typeAtoms();
+            const list: ?[]u32 = if (enter.more_types) self.readTypeList(io, enter.source) else null;
+            defer if (list) |owned| self.allocator.free(owned);
+            target.chosen = x11_drag.rankTypes(list orelse &enter.types, kinds, atoms);
+        }
+        self.drop_target = target;
+        return .{ .nop = {} };
+    }
+
+    /// XdndPosition: answer with XdndStatus and report the pointer. Every position is asked
+    /// for (an empty rectangle) so `drag_motion` follows the pointer.
+    fn xdndPosition(self: *@This(), io: std.Io, window: u32, position: x11.xdnd.Position) common.Event {
+        const target = &(self.drop_target orelse return .{ .nop = {} });
+        if (target.window != window or target.source != position.source or target.awaiting_drop) return .{ .nop = {} };
+        if (!target.origin_valid) self.refreshOrigin(io, target);
+        target.x = clampCoordinate(@as(i32, position.root_x) - target.origin_x);
+        target.y = clampCoordinate(@as(i32, position.root_y) - target.origin_y);
+
+        const accept = target.chosen != null;
+        self.sendXdnd(io, target.source, self.atoms.xdnd_status, (x11.xdnd.Status{
+            .target = window,
+            .accept = accept,
+            .send_every_position = true,
+            .rect = .{},
+            .action = if (accept) self.atoms.xdnd_action_copy else 0,
+        }).pack());
+        if (!accept) return .{ .nop = {} };
+        if (!target.entered) {
+            target.entered = true;
+            return .{ .drag_enter = .{ .x = target.x, .y = target.y, .kind = target.chosen.?.kind, .window_id = window } };
+        }
+        return .{ .drag_motion = .{ .x = target.x, .y = target.y, .window_id = window } };
+    }
+
+    /// Our window's root origin, which turns the positions' root coordinates into window ones.
+    fn refreshOrigin(self: *@This(), io: std.Io, target: *x11_drag.DropTarget) void {
+        const reply = self.translate(io, target.window, self.info.screens[0].root, 0, 0) catch |err| {
+            log.debug("The drop target's origin could not be read: {any}", .{err});
+            return;
+        };
+        target.origin_x = reply.dst_x;
+        target.origin_y = reply.dst_y;
+        target.origin_valid = true;
+    }
+
+    fn xdndLeave(self: *@This(), window: u32, leave: x11.xdnd.Leave) common.Event {
+        const target = self.drop_target orelse return .{ .nop = {} };
+        if (target.window != window or target.source != leave.source) return .{ .nop = {} };
+        // A leave after the drop is a confused source; the fetch decides the drop.
+        if (target.awaiting_drop) return .{ .nop = {} };
+        self.drop_target = null;
+        return if (target.entered) .{ .drag_leave = window } else .{ .nop = {} };
+    }
+
+    /// XdndDrop: fetch the payload as the paste does, with a deadline on the source.
+    fn xdndDrop(self: *@This(), io: std.Io, window: u32, drop: x11.xdnd.Drop) common.Event {
+        const target = &(self.drop_target orelse return .{ .nop = {} });
+        if (target.window != window or target.source != drop.source or target.awaiting_drop) return .{ .nop = {} };
+        const chosen = target.chosen orelse return self.settleDrop(io, null);
+        // From the side connection: with an owner, the answer is the owner's SendEvent to our
+        // window, which reaches this task; without one, the server's answer goes to the
+        // requesting connection, where it is dropped, and the timer refuses the drop.
+        _ = self.sendClipboard(io, x11.proto.ConvertSelection{
+            .requestor = window,
+            .selection = self.atoms.xdnd_selection,
+            .target = chosen.atom,
+            .property = self.atoms.mir_drop,
+            .time = drop.time,
+        }, null) catch |err| {
+            log.warn("ConvertSelection for a drop failed: {any}", .{err});
+            return self.settleDrop(io, null);
+        };
+        target.awaiting_drop = true;
+        target.progress = 0;
+        target.progress_at_timer = 0;
+        target.timer_generation = self.startTimer(io, window, drop_fetch_timeout);
+        return .{ .nop = {} };
+    }
+
+    /// The source answered the ConvertSelection of a drop.
+    fn finishDrop(self: *@This(), io: std.Io, notify: x11.proto.SelectionNotify) common.Event {
+        const target = &(self.drop_target orelse return .{ .nop = {} });
+        if (!target.awaiting_drop or notify.requestor != target.window) return .{ .nop = {} };
+        if (notify.property != 0 and notify.property != self.atoms.mir_drop) return .{ .nop = {} };
+        if (notify.property == 0) return self.settleDrop(io, null);
+        const fetched = self.fetchDropProperty(io, target) catch |err| blk: {
+            log.warn("Failed to fetch a drop's property: {any}", .{err});
+            break :blk DropFetch{ .data = null };
+        };
+        return switch (fetched) {
+            .incr => .{ .nop = {} },
+            .data => |data| self.settleDrop(io, data),
+        };
+    }
+
+    const DropFetch = union(enum) { incr, data: ?common.DropData };
+
+    /// Read the drop's property: an INCR transfer begins and completes through
+    /// `continueIncrPaste`; anything else decodes now.
+    fn fetchDropProperty(self: *@This(), io: std.Io, target: *x11_drag.DropTarget) !DropFetch {
+        var property = try self.readProperty(io, target.window, self.atoms.mir_drop, true);
+        defer property.value.deinit(self.allocator);
+        if (property.property_type == self.atoms.incr) {
+            self.dropIncrPaste();
+            self.incr_paste = .{
+                .kind = .drop,
+                .generation = target.timer_generation,
+                .requestor = target.window,
+                .property = self.atoms.mir_drop,
+                .string = false,
+            };
+            return .incr;
+        }
+        if (property.property_type == 0 or property.format != 8) return .{ .data = null };
+        const kind = target.chosen.?.kind;
+        if (kind == .text and property.property_type == self.atoms.string) {
+            return .{ .data = .{ .text = try latin1ToUtf8(self.allocator, property.value.items) } };
+        }
+        return .{ .data = try self.decodeDrop(kind, property.value.items) };
+    }
+
+    /// The payload UTF-8 `bytes` make as `kind`; null for a uri-list naming no local file.
+    fn decodeDrop(self: *@This(), kind: common.DropKind, bytes: []const u8) std.mem.Allocator.Error!?common.DropData {
+        switch (kind) {
+            .text => return .{ .text = try self.allocator.dupe(u8, bytes) },
+            .files => {
+                const paths = try uri_list.parse(self.allocator, bytes);
+                if (paths.len == 0) {
+                    uri_list.free(self.allocator, paths);
+                    return null;
+                }
+                return .{ .files = paths };
+            },
+        }
+    }
+
+    /// End the drop: XdndFinished to the source, and either the payload stored for `takeDrop`
+    /// with a `drop` event, or a `drag_leave` when nothing usable came.
+    fn settleDrop(self: *@This(), io: std.Io, data: ?common.DropData) common.Event {
+        const target = self.drop_target.?;
+        self.drop_target = null;
+        self.abandonDropIncr();
+        const accepted = data != null;
+        self.sendXdnd(io, target.source, self.atoms.xdnd_finished, (x11.xdnd.Finished{
+            .target = target.window,
+            .accepted = accepted,
+            .action = if (accepted) self.atoms.xdnd_action_copy else 0,
+        }).pack());
+        if (data) |payload| {
+            self.clipboard_mutex.lockUncancelable(io);
+            defer self.clipboard_mutex.unlock(io);
+            if (self.pending_drop) |old| old.deinit(self.allocator);
+            self.pending_drop = payload;
+            return .{ .drop = .{ .x = target.x, .y = target.y, .kind = target.chosen.?.kind, .window_id = target.window } };
+        }
+        return if (target.entered) .{ .drag_leave = target.window } else .{ .nop = {} };
+    }
+
+    // The drag source: a drag of ours, from the start message until drag_finished.
+
+    /// A MIR_DRAG_CONTROL message to one of our windows.
+    fn dragControl(self: *@This(), io: std.Io, window: u32, code: x11_drag.Control, generation: u32) common.Event {
+        switch (code) {
+            .timeout => {
+                if (self.drop_target) |*target| {
+                    if (target.awaiting_drop and target.timer_generation == generation) {
+                        // An INCR source still sending is not silent; wait once more.
+                        if (target.progress != target.progress_at_timer) {
+                            target.progress_at_timer = target.progress;
+                            target.timer_generation = self.startTimer(io, window, drop_fetch_timeout);
+                            return .{ .nop = {} };
+                        }
+                        _ = self.sendClipboard(io, x11.proto.DeleteProperty{ .window_id = window, .property = self.atoms.mir_drop }, null) catch {};
+                        return self.settleDrop(io, null);
+                    }
+                }
+                if (self.drag_source) |drag| {
+                    if (drag.timer_generation == generation) return self.dragTimeout(io);
+                }
+                return .{ .nop = {} };
+            },
+            .grab_failed => {
+                if (self.drag_source) |drag| {
+                    if (drag.window == window) return self.finishDrag(io, false);
+                }
+                return .{ .nop = {} };
+            },
+            .started => return self.dragStarted(),
+            _ => return .{ .nop = {} },
+        }
+    }
+
+    /// Take the drag `startDrag` set up.
+    fn dragStarted(self: *@This()) common.Event {
+        self.clipboard_mutex.lockUncancelable(self.io);
+        defer self.clipboard_mutex.unlock(self.io);
+        const request = self.drag_request orelse return .{ .nop = {} };
+        self.drag_request = null;
+        self.drag_source = request;
+        return .{ .nop = {} };
+    }
+
+    /// The pointer moved during a drag of ours (forwarded by the grab task, in root
+    /// coordinates): find the target under it and send the position, one in flight at a time.
+    fn dragMotion(self: *@This(), io: std.Io, position: x11_drag.Position) common.Event {
+        const drag = &self.drag_source.?;
+        if (drag.state != .dragging or drag.release != null) return .{ .nop = {} };
+        self.locateTarget(io, drag, position.root_x, position.root_y);
+        if (drag.target == null) return .{ .nop = {} };
+        if (drag.gate.offer(position)) |now| self.sendPosition(io, drag, now);
+        return .{ .nop = {} };
+    }
+
+    /// The XDND-aware window under the pointer. One round trip finds the toplevel; the walk
+    /// down through it runs once per toplevel entered, the way GTK and Qt do it.
+    fn locateTarget(self: *@This(), io: std.Io, drag: *x11_drag.DragSource, root_x: i16, root_y: i16) void {
+        const root = self.info.screens[0].root;
+        const translated = self.translate(io, root, root, root_x, root_y) catch |err| {
+            log.debug("The toplevel under the pointer could not be found: {any}", .{err});
+            self.changeTarget(io, drag, 0, null);
+            return;
+        };
+        const frame = translated.child;
+        if (drag.frame_valid and frame == drag.frame) return;
+        const target = if (frame != 0) self.walkToAware(io, frame, root_x, root_y) else null;
+        self.changeTarget(io, drag, frame, target);
+    }
+
+    /// Descend from `toplevel` to the window under the point that has XdndAware, honouring an
+    /// XdndProxy on the way (the proxy gets the messages, and its XdndAware is the one that
+    /// counts).
+    fn walkToAware(self: *@This(), io: std.Io, toplevel: u32, root_x: i16, root_y: i16) ?x11_drag.DragSource.Target {
+        const root = self.info.screens[0].root;
+        var window = toplevel;
+        // Bounded: no window tree is this deep, and a proxy loop must not hang the reader task.
+        for (0..max_walk_depth) |_| {
+            const aware_window = self.readWindowProperty(io, window, self.atoms.xdnd_proxy) orelse window;
+            if (self.readWindowProperty(io, aware_window, self.atoms.xdnd_aware)) |version| {
+                if (version >= 3) return .{ .window = aware_window, .version = @intCast(@min(x11.xdnd.version, version)) };
+            }
+            const translated = self.translate(io, root, window, root_x, root_y) catch return null;
+            if (translated.child == 0) return null;
+            window = translated.child;
+        }
+        return null;
+    }
+
+    /// Move the drag to `target` (or to nothing): XdndLeave to the old one, XdndEnter to the new.
+    fn changeTarget(self: *@This(), io: std.Io, drag: *x11_drag.DragSource, frame: u32, target: ?x11_drag.DragSource.Target) void {
+        drag.frame = frame;
+        drag.frame_valid = true;
+        const same = if (drag.target) |old| target != null and old.window == target.?.window else target == null;
+        if (same) return;
+        if (drag.target) |old| {
+            self.sendXdnd(io, old.window, self.atoms.xdnd_leave, (x11.xdnd.Leave{ .source = drag.window }).pack());
+        }
+        drag.target = target;
+        drag.gate.reset();
+        drag.accepted = null;
+        if (target) |entered| {
+            self.sendXdnd(io, entered.window, self.atoms.xdnd_enter, (x11.xdnd.Enter{
+                .source = drag.window,
+                .version = entered.version,
+                .more_types = true,
+                .types = drag.enterTypes(),
+            }).pack());
+        }
+    }
+
+    fn sendPosition(self: *@This(), io: std.Io, drag: *x11_drag.DragSource, position: x11_drag.Position) void {
+        const target = drag.target orelse return;
+        self.sendXdnd(io, target.window, self.atoms.xdnd_position, (x11.xdnd.Position{
+            .source = drag.window,
+            .root_x = position.root_x,
+            .root_y = position.root_y,
+            .time = position.time,
+            .action = self.atoms.xdnd_action_copy,
+        }).pack());
+    }
+
+    /// XdndStatus from the current target: record the verdict, send the position that waited,
+    /// and settle a release that was waiting on it.
+    fn dragStatus(self: *@This(), io: std.Io, window: u32, status: x11.xdnd.Status) common.Event {
+        const drag = &(self.drag_source orelse return .{ .nop = {} });
+        if (drag.window != window) return .{ .nop = {} };
+        const target = drag.target orelse return .{ .nop = {} };
+        if (status.target != target.window) return .{ .nop = {} };
+        drag.accepted = status.accept;
+        if (drag.gate.statusArrived()) |pending| {
+            self.sendPosition(io, drag, pending);
+            return .{ .nop = {} };
+        }
+        if (drag.state == .dragging) {
+            if (drag.release) |time| return self.settleRelease(io, drag, time);
+        }
+        return .{ .nop = {} };
+    }
+
+    /// The button came up: drop on a target that accepted, once no position is outstanding.
+    fn dragRelease(self: *@This(), io: std.Io, time: u32) common.Event {
+        const drag = &self.drag_source.?;
+        if (drag.state != .dragging or drag.release != null) return .{ .nop = {} };
+        drag.release = time;
+        if (drag.target != null and drag.gate.outstanding) {
+            // The target's verdict on the last position decides; a silent target is a refusal.
+            drag.timer_generation = self.startTimer(io, drag.window, drag_status_timeout);
+            return .{ .nop = {} };
+        }
+        return self.settleRelease(io, drag, time);
+    }
+
+    fn settleRelease(self: *@This(), io: std.Io, drag: *x11_drag.DragSource, time: u32) common.Event {
+        if (drag.target) |target| {
+            if (drag.accepted == true) {
+                self.sendXdnd(io, target.window, self.atoms.xdnd_drop, (x11.xdnd.Drop{ .source = drag.window, .time = time }).pack());
+                drag.state = .dropped;
+                // The selection stays served until the target says it is done.
+                drag.timer_generation = self.startTimer(io, drag.window, drag_finish_timeout);
+                return .{ .nop = {} };
+            }
+            self.sendXdnd(io, target.window, self.atoms.xdnd_leave, (x11.xdnd.Leave{ .source = drag.window }).pack());
+        }
+        return self.finishDrag(io, false);
+    }
+
+    /// XdndFinished from the target we dropped on. Before version 5 it says nothing about
+    /// the outcome, and a target that got this far took the drop.
+    fn dragFinished(self: *@This(), io: std.Io, window: u32, finished: x11.xdnd.Finished) common.Event {
+        const drag = &(self.drag_source orelse return .{ .nop = {} });
+        if (drag.window != window or drag.state != .dropped) return .{ .nop = {} };
+        const target = drag.target orelse return .{ .nop = {} };
+        if (finished.target != target.window) return .{ .nop = {} };
+        const accepted = if (target.version >= 5) finished.accepted else true;
+        return self.finishDrag(io, accepted);
+    }
+
+    /// A timer of the drag ran out: the target never answered the last position, or never
+    /// finished the drop.
+    fn dragTimeout(self: *@This(), io: std.Io) common.Event {
+        const drag = &self.drag_source.?;
+        switch (drag.state) {
+            .dragging => {
+                drag.gate.reset();
+                return self.settleRelease(io, drag, drag.release orelse 0);
+            },
+            .dropped => return self.finishDrag(io, false),
+        }
+    }
+
+    /// Escape: leave the target, if any, and end the drag as refused.
+    fn cancelDrag(self: *@This(), io: std.Io) common.Event {
+        const drag = &self.drag_source.?;
+        if (drag.state == .dragging) {
+            if (drag.target) |target| {
+                self.sendXdnd(io, target.window, self.atoms.xdnd_leave, (x11.xdnd.Leave{ .source = drag.window }).pack());
+            }
+        }
+        return self.finishDrag(io, false);
+    }
+
+    /// End the drag: release the pointer and the selection, free the payload, and report.
+    fn finishDrag(self: *@This(), io: std.Io, accepted: bool) common.Event {
+        const drag = self.drag_source.?;
+        self.drag_source = null;
+        self.releasePointerGrab(drag.grab);
+        _ = self.sendClipboard(io, x11.proto.SetSelectionOwner{ .owner = 0, .selection = self.atoms.xdnd_selection }, null) catch {};
+        {
+            self.clipboard_mutex.lockUncancelable(io);
+            defer self.clipboard_mutex.unlock(io);
+            const owned = self.stateOf(.drag);
+            if (owned.owner == drag.window) {
+                if (owned.payload) |payload| payload.deinit(self.allocator);
+                owned.payload = null;
+                owned.owner = 0;
+            }
+            self.drag_active = false;
+        }
+        return .{ .drag_finished = .{ .accepted = accepted, .window_id = drag.window } };
+    }
 };
+
+/// How far `walkToAware` descends before giving up.
+const max_walk_depth = 32;
+
+fn clampCoordinate(value: i32) i16 {
+    return @intCast(std.math.clamp(value, std.math.minInt(i16), std.math.maxInt(i16)));
+}
 
 /// How long a paste waits for the owner to answer, or to send the next INCR chunk. The server
 /// answers an ownerless selection at once, so only an owner that is hung or gone runs this out.
@@ -1059,7 +1826,26 @@ const incr_step_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(
 /// How much of a property one GetProperty asks for; longer values are read in several.
 const property_read_bytes: u32 = 256 * 1024;
 
-const selection_count = @typeInfo(common.Selection).@"enum".fields.len;
+const selection_count = @typeInfo(SelectionIndex).@"enum".fields.len;
+
+/// How long a drop target waits for the source to answer the ConvertSelection, restarted by
+/// every INCR chunk.
+const drop_fetch_timeout = std.Io.Duration.fromSeconds(1);
+/// How long a drag source waits for the target's XdndStatus once the button is up.
+const drag_status_timeout = std.Io.Duration.fromSeconds(1);
+/// How long a drag source waits for the target's XdndFinished after the drop.
+const drag_finish_timeout = std.Io.Duration.fromSeconds(5);
+
+const keysym_escape: u32 = 0xFF1B;
+
+/// The atoms of an XdndTypeList property: 32-bit values, whatever the alignment of the bytes read.
+fn atomsFromBytes(allocator: std.mem.Allocator, bytes: []const u8) ![]u32 {
+    const atoms = try allocator.alloc(u32, bytes.len / 4);
+    for (atoms, 0..) |*atom, index| atom.* = std.mem.readInt(u32, bytes[index * 4 ..][0..4], native_endian);
+    return atoms;
+}
+
+const native_endian = builtin.cpu.arch.endian();
 
 /// The most text a single ChangeProperty can carry on this server, and so the INCR chunk size.
 fn maxPropertyBytes(info: x11.Setup) usize {
@@ -1067,18 +1853,34 @@ fn maxPropertyBytes(info: x11.Setup) usize {
     return (request_limit -| @sizeOf(x11.proto.ChangeProperty)) & ~@as(usize, 3);
 }
 
-/// One selection we may own: its atom, the text served for it and the window that claimed it.
+/// One selection we may own: its atom, the payload served for it and the window that claimed it.
 const OwnedSelection = struct {
     atom: u32,
     /// Null once another client took the selection.
-    text: ?[]u8 = null,
+    payload: ?x11_drag.Payload = null,
     /// 0 while we do not own it.
     owner: u32 = 0,
+};
+
+/// The selections this backend serves: the two public ones, and XdndSelection for a drag of ours.
+const SelectionIndex = enum {
+    clipboard,
+    primary,
+    drag,
+
+    fn of(which: common.Selection) SelectionIndex {
+        return switch (which) {
+            .clipboard => .clipboard,
+            .primary => .primary,
+        };
+    }
 };
 
 /// An INCR transfer being received: the owner appends chunks to `property` on `requestor`,
 /// each announced by a PropertyNotify, until an empty one.
 const IncrPaste = struct {
+    /// Whether the text completes a paste or a drop; `generation` is the paste's, or the drop's timer generation.
+    kind: enum { paste, drop },
     generation: u32,
     requestor: u32,
     property: u32,
@@ -1347,9 +2149,15 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        // The server drops a destroyed window's selections without a SelectionClear.
+        // The server drops a destroyed window's selections without a SelectionClear; a drag of
+        // this window's own ends on the DestroyNotify the reader task gets.
         self.wm.dropSelection(self.wm.io, self.window_id, .clipboard);
         self.wm.dropSelection(self.wm.io, self.window_id, .primary);
+        {
+            self.wm.clipboard_mutex.lockUncancelable(self.wm.io);
+            defer self.wm.clipboard_mutex.unlock(self.wm.io);
+            _ = self.wm.drop_kinds.remove(self.window_id);
+        }
         x11.send(self.wm.io, self.wm.conn, x11.proto.DestroyWindow{ .window_id = self.window_id }) catch |err| {
             log.err("Error destroying window: {any}", .{err});
         };
@@ -1375,6 +2183,25 @@ pub const Window = struct {
     /// The primary selection's text as UTF-8, owned by the caller; see `getClipboardText`.
     pub fn getPrimaryText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
         return self.wm.paste(allocator, self.window_id, .primary);
+    }
+
+    /// Take drops of the given kinds, which puts XdndAware on the window for sources to find;
+    /// `.{}` takes it off again. `error.DragUnsupported` without the side connection.
+    pub fn setDropTarget(self: *@This(), kinds: common.DropKinds) common.DragError!void {
+        return self.wm.setDropTarget(self.window_id, kinds);
+    }
+
+    /// The newest drop's payload, copied into `allocator`; the stored one is freed.
+    /// `error.NoDrop` when none is pending.
+    pub fn takeDrop(self: *@This(), allocator: std.mem.Allocator) (common.DropError || std.mem.Allocator.Error)!common.DropData {
+        return self.wm.takeDrop(allocator);
+    }
+
+    /// Start dragging `data` out of this window. Call it while a mouse button is held: the grab
+    /// takes the pointer wherever it is, and the drag ends at the next button release, which
+    /// `drag_finished` reports. Escape cancels while this window has the keyboard focus.
+    pub fn startDrag(self: *@This(), data: common.DragData) common.DragError!void {
+        return self.wm.startDrag(self.window_id, data);
     }
 
     pub fn close(self: *@This()) void {
@@ -2205,6 +3032,18 @@ test "clipboard entry points compile" {
     _ = &Window.getPrimaryText;
     _ = &Window.deinit;
     _ = &IncrSend.run;
+    _ = &Window.setDropTarget;
+    _ = &Window.takeDrop;
+    _ = &Window.startDrag;
+}
+
+test "atomsFromBytes reads 32-bit atoms out of unaligned property bytes" {
+    const bytes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+    const atoms = try atomsFromBytes(testing.allocator, bytes[1..]);
+    defer testing.allocator.free(atoms);
+    try testing.expectEqual(@as(usize, 2), atoms.len);
+    try testing.expectEqual(std.mem.readInt(u32, bytes[1..5], native_endian), atoms[0]);
+    try testing.expectEqual(std.mem.readInt(u32, bytes[5..9], native_endian), atoms[1]);
 }
 
 test "maxPropertyBytes leaves room for the request header and stays word-aligned" {
@@ -2234,6 +3073,25 @@ const Atoms = struct {
     incr: u32,
     /// Where paste results land on the requesting window.
     mir_clipboard: u32,
+    xdnd_aware: u32,
+    xdnd_selection: u32,
+    xdnd_enter: u32,
+    xdnd_position: u32,
+    xdnd_status: u32,
+    xdnd_leave: u32,
+    xdnd_drop: u32,
+    xdnd_finished: u32,
+    xdnd_type_list: u32,
+    xdnd_proxy: u32,
+    xdnd_action_copy: u32,
+    mime_uri_list: u32,
+    mime_utf8: u32,
+    mime_text_plain: u32,
+    /// Where a drop's payload lands on the target window.
+    mir_drop: u32,
+    /// Drag bookkeeping messages to our own windows: a timer running out, the grab task
+    /// failing, the caller starting a drag; see `x11_drag.Control`.
+    mir_drag_control: u32,
 };
 
 const std = @import("std");
@@ -2244,5 +3102,8 @@ const common = @import("common.zig");
 const keys = @import("keys.zig");
 const Compose = @import("compose.zig");
 const EventQueue = @import("event_queue.zig");
+const x11_drag = @import("x11_drag.zig");
+const uri_list = @import("uri_list.zig");
+const builtin = @import("builtin");
 
 const log = std.log.scoped(.any_x11);

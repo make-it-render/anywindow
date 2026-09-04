@@ -68,6 +68,86 @@ pub const Selection = enum {
     primary,
 };
 
+/// What a window takes when something is dragged over it. The empty set refuses every drag.
+pub const DropKinds = packed struct {
+    text: bool = false,
+    files: bool = false,
+
+    pub fn any(self: @This()) bool {
+        return self.text or self.files;
+    }
+};
+
+/// The kind of payload a drop delivers.
+pub const DropKind = enum {
+    text,
+    files,
+};
+
+/// A drop's payload, owned by whoever holds it. Files are absolute native paths (POSIX on
+/// Linux, drive paths on Windows), decoded from `text/uri-list` or `CF_HDROP`.
+pub const DropData = union(DropKind) {
+    text: []u8,
+    files: []const []u8,
+
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+        switch (self) {
+            .text => |text| allocator.free(text),
+            .files => |files| {
+                for (files) |path| allocator.free(path);
+                allocator.free(files);
+            },
+        }
+    }
+
+    /// A copy of the payload in `allocator`.
+    pub fn dupe(self: @This(), allocator: std.mem.Allocator) std.mem.Allocator.Error!@This() {
+        switch (self) {
+            .text => |text| return .{ .text = try allocator.dupe(u8, text) },
+            .files => |files| {
+                const copies = try allocator.alloc([]u8, files.len);
+                var copied: usize = 0;
+                errdefer {
+                    for (copies[0..copied]) |path| allocator.free(path);
+                    allocator.free(copies);
+                }
+                for (files) |path| {
+                    copies[copied] = try allocator.dupe(u8, path);
+                    copied += 1;
+                }
+                return .{ .files = copies };
+            },
+        }
+    }
+};
+
+/// What a drag hands out. Text goes out as UTF-8 under every text type the platform knows;
+/// files go out as `text/uri-list` (or `CF_HDROP` on Windows), and as that list under the
+/// text types too.
+pub const DragData = union(DropKind) {
+    text: []const u8,
+    files: []const []const u8,
+};
+
+/// What `Window.takeDrop` fails with.
+pub const DropError = error{
+    /// No drop is waiting: none happened since the last `takeDrop`.
+    NoDrop,
+};
+
+/// What `Window.setDropTarget` and `Window.startDrag` fail with.
+pub const DragError = error{
+    /// The platform has nothing to register with or drag through: no data device on this
+    /// Wayland connection, OLE refused on Windows.
+    DragUnsupported,
+    /// No mouse button is held on the window, so there is no press to hang the drag on.
+    DragNoButton,
+    /// A drag from this process is still running.
+    DragInProgress,
+    /// The payload or the drag's own state could not be allocated.
+    OutOfMemory,
+};
+
 pub const Event = union(enum) {
     nop: void,
     close: WindowID,
@@ -156,6 +236,41 @@ pub const Event = union(enum) {
     /// client, so the event can also mean "it may have changed while you
     /// were away". The primary selection never raises it.
     clipboard_changed: void,
+    /// A drag carrying something this window takes (see `Window.setDropTarget`)
+    /// came over it; `kind` is what `drop` will deliver. The source holds the
+    /// pointer for as long as the drag lasts, so the pointer events stop and
+    /// `drag_motion` is the position. A drag the window refuses, or that
+    /// carries nothing it takes, produces no events at all.
+    drag_enter: struct {
+        x: X,
+        y: Y,
+        kind: DropKind,
+        window_id: WindowID,
+    },
+    /// The drag moved over the window. Only between `drag_enter` and the
+    /// `drag_leave` or `drop` that ends the hover.
+    drag_motion: struct {
+        x: X,
+        y: Y,
+        window_id: WindowID,
+    },
+    /// The drag left without dropping, or a drop failed. Ends the hover
+    /// `drag_enter` began.
+    drag_leave: WindowID,
+    /// Something was dropped and its payload is ready: `Window.takeDrop`
+    /// returns it. Ends the hover.
+    drop: struct {
+        x: X,
+        y: Y,
+        kind: DropKind,
+        window_id: WindowID,
+    },
+    /// A drag this window started (`Window.startDrag`) ended; `accepted` is
+    /// whether a target took it.
+    drag_finished: struct {
+        accepted: bool,
+        window_id: WindowID,
+    },
 };
 
 pub const Cursor = enum {
@@ -175,3 +290,18 @@ pub const Cursor = enum {
 };
 
 pub const keys = @import("keys.zig");
+
+const std = @import("std");
+
+test "DropData copies and frees both kinds" {
+    const testing = std.testing;
+    const text = try (DropData{ .text = @constCast("hello") }).dupe(testing.allocator);
+    defer text.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello", text.text);
+
+    const originals = [_][]u8{ @constCast("/a"), @constCast("/b c") };
+    const files = try (DropData{ .files = &originals }).dupe(testing.allocator);
+    defer files.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), files.files.len);
+    try testing.expectEqualStrings("/b c", files.files[1]);
+}

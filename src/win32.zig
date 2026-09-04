@@ -72,6 +72,9 @@ pub const Window = struct {
     saved_style: isize = 0,
     saved_rect: win.Rect = .{},
 
+    /// The OLE drop target registered on the window thread; outlives the thread, and holds the drop payload and the drag flag.
+    drop_target: *win32_drag.Target,
+
     pub fn init(wm: *WindowManager, options: common.WindowOptions) !@This() {
         const count = class_count.fetchAdd(1, .monotonic);
         const class_name_n = try std.fmt.allocPrint(wm.allocator, "WindowClass_{d}", .{count});
@@ -79,6 +82,9 @@ pub const Window = struct {
 
         const class_name = try win.W(wm.allocator, class_name_n);
         const background = win.CreateSolidBrush(commonPixelToWinPixel(options.background));
+        // Heap-allocated: the thread registers it after `init` has returned, and OLE holds it until the thread revokes it.
+        const drop_target = try win32_drag.Target.create(wm.allocator, wm.io, &events);
+        errdefer drop_target.com.release();
 
         // Class cursor is null — we handle WM_SETCURSOR ourselves
         // so setCursor/hideCursor work reliably.
@@ -101,11 +107,15 @@ pub const Window = struct {
             .class_name = class_name,
             .title = title,
             .background = background,
+            .drop_target = drop_target,
         };
 
         // TODO: check for support in single_threaded build
         const thread = std.Thread.spawn(.{}, WindowThread.run, .{&ctx}) catch return error.ThreadSpawnError;
-        try ctx.wait();
+        ctx.wait() catch |err| {
+            thread.join();
+            return err;
+        };
 
         return .{
             .wm = wm,
@@ -118,6 +128,7 @@ pub const Window = struct {
             .scaling = ctx.scaling,
             .thread = thread,
             .thread_id = ctx.thread_id,
+            .drop_target = drop_target,
         };
     }
 
@@ -126,6 +137,8 @@ pub const Window = struct {
             _ = win.PostThreadMessageW(self.thread_id, @intFromEnum(win.MessageType.WM_QUIT), 0, 0);
         }
         if (self.thread) |t| t.join();
+        // The thread revoked the registration before ending, so this is the last reference.
+        self.drop_target.com.release();
         self.wm.allocator.free(self.title);
         self.wm.allocator.free(self.class_name);
     }
@@ -332,6 +345,40 @@ pub const Window = struct {
         return error.ClipboardEmpty;
     }
 
+    /// Take drops of the given kinds; `.{}` turns them off again. The window was registered with OLE when its thread started, so this only records what to accept; `error.DragUnsupported` when that registration failed (OLE refused, or the thread was already in the multithreaded apartment).
+    pub fn setDropTarget(self: *@This(), kinds: common.DropKinds) common.DragError!void {
+        if (!self.drop_target.ready.load(.acquire)) return error.DragUnsupported;
+        self.drop_target.setKinds(kinds);
+    }
+
+    /// The newest drop's payload, copied into `allocator`; the stored one is freed. `error.NoDrop` when none is pending.
+    pub fn takeDrop(self: *@This(), allocator: std.mem.Allocator) (common.DropError || std.mem.Allocator.Error)!common.DropData {
+        return self.drop_target.takeDrop(allocator);
+    }
+
+    /// Start dragging `data` out of this window: the payload is rendered here, and the drag itself (`DoDragDrop`, a modal loop) runs on the window thread from a posted message, ending in `drag_finished`. Needs a mouse button down (`error.DragNoButton`), one drag at a time per window (`error.DragInProgress`), and OLE on the window thread (`error.DragUnsupported`, also the answer for a payload that is not UTF-8).
+    pub fn startDrag(self: *@This(), data: common.DragData) common.DragError!void {
+        const target = self.drop_target;
+        if (!target.ready.load(.acquire)) return error.DragUnsupported;
+        if (!win32_drag.buttonHeld()) return error.DragNoButton;
+        if (target.dragging.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.DragInProgress;
+        errdefer target.dragging.store(false, .release);
+
+        const object = win32_drag.Data.create(self.wm.allocator, data) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.debug("Drag payload could not be rendered: {t}", .{err});
+                return error.DragUnsupported;
+            },
+        };
+        errdefer object.com.release();
+        const source = win32_drag.Source.create(self.wm.allocator) catch return error.OutOfMemory;
+        errdefer source.com.release();
+        if (win.PostMessageW(self.handle, wm_start_drag_code, @intFromPtr(object), @bitCast(@intFromPtr(source))) == .not_ok) {
+            return error.DragUnsupported;
+        }
+    }
+
     pub fn beginDraw(self: *@This()) !void {
         const window_dc = win.GetDC(self.handle);
         self.window_dc = window_dc;
@@ -518,6 +565,7 @@ const WindowThread = struct {
     class_name: [:0]u16,
     title: [:0]u16,
     background: ?win.BrushHandler,
+    drop_target: *win32_drag.Target,
 
     // Output — written by thread before signaling ready
     handle: ?win.WindowHandle = null,
@@ -536,6 +584,14 @@ const WindowThread = struct {
         self.mutex.lockUncancelable(self.wm.io);
 
         self.thread_id = win.GetCurrentThreadId();
+
+        // OLE goes up before the window, since the registration below belongs to this thread's apartment, and comes down after the pump. A thread already in the multithreaded apartment is refused (RPC_E_CHANGED_MODE), which leaves the window without drag and drop rather than without a window.
+        const ole_result = ole.OleInitialize(null);
+        const ole_ready = ole.succeeded(ole_result);
+        if (!ole_ready) log.debug("OleInitialize failed ({x}); no drag and drop", .{@as(u32, @bitCast(@intFromEnum(ole_result)))});
+        defer if (ole_ready) ole.OleUninitialize();
+        const drop_target = self.drop_target;
+        defer revokeDropTarget(drop_target);
 
         const handle = win.CreateWindowExW(
             win.ExtendedWindowStyle.OverlappedWindow,
@@ -578,6 +634,19 @@ const WindowThread = struct {
         const dpi = win.GetDpiForWindow(handle);
         self.scaling = @as(f32, @floatFromInt(dpi)) / 96.0;
 
+        // The drop target is registered unconditionally; the kinds decide what it accepts. The window procedure reaches it through the window's user data for the drag message.
+        drop_target.handle = handle;
+        drop_target.window_id = @intFromPtr(handle.?);
+        _ = win.SetWindowLongPtrW(handle, win.GWLP_USERDATA, @bitCast(@intFromPtr(drop_target)));
+        if (ole_ready) {
+            const registered = ole.RegisterDragDrop(handle.?, drop_target.com.interface());
+            if (ole.succeeded(registered)) {
+                drop_target.ready.store(true, .release);
+            } else {
+                log.debug("RegisterDragDrop failed ({x}); no drag and drop", .{@as(u32, @bitCast(@intFromEnum(registered)))});
+            }
+        }
+
         self.ready = true;
         self.cond.signal(self.wm.io);
         self.mutex.unlock(self.wm.io);
@@ -592,6 +661,13 @@ const WindowThread = struct {
                 flushPendingKey();
             }
         }
+    }
+
+    /// Undo the registration, on the thread that made it, before OLE goes down with it.
+    fn revokeDropTarget(drop_target: *win32_drag.Target) void {
+        if (!drop_target.ready.load(.acquire)) return;
+        drop_target.ready.store(false, .release);
+        _ = ole.RevokeDragDrop(drop_target.handle.?);
     }
 
     /// TranslateMessage queues the character a key down produces (WM_CHAR,
@@ -869,11 +945,27 @@ pub fn windowProc(
             }
             return 0;
         },
+        wm_start_drag => {
+            // Posted by `startDrag` with the two objects it built; the drag runs to its end here, on the thread that owns the window, and the objects go with it.
+            const data: *win32_drag.Data = @ptrFromInt(wparam);
+            const source: *win32_drag.Source = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            const accepted = win32_drag.runDrag(data, source);
+            events.push(.{ .drag_finished = .{ .accepted = accepted, .window_id = window_id } });
+            if (dropTargetOf(window_handle)) |target| target.dragging.store(false, .release);
+            return 0;
+        },
         else => {
             return win.DefWindowProcW(window_handle, message_type, wparam, lparam);
         },
     }
     return 1;
+}
+
+/// The window's drop target, kept in its user data by the window thread.
+fn dropTargetOf(window_handle: win.WindowHandle) ?*win32_drag.Target {
+    const stored = win.GetWindowLongPtrW(window_handle, win.GWLP_USERDATA);
+    if (stored == 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(stored)));
 }
 
 /// Whether a WM_CLIPBOARDUPDATE quoting `sequence` is a change nobody has reported yet; see
@@ -898,6 +990,9 @@ const wm_setfocus: win.MessageType = @enumFromInt(0x0007);
 const wm_killfocus: win.MessageType = @enumFromInt(0x0008);
 const wm_unichar_code: u32 = 0x0109;
 const wm_unichar: win.MessageType = @enumFromInt(wm_unichar_code);
+/// `startDrag`'s message to the window thread: wParam the data object, lParam the drop source.
+const wm_start_drag_code: u32 = win.WM_USER + 1;
+const wm_start_drag: win.MessageType = @enumFromInt(wm_start_drag_code);
 const pm_remove: u32 = 0x0001;
 
 extern "user32" fn PeekMessageW(
@@ -992,7 +1087,7 @@ const clipboard_open_retry = std.Io.Duration.fromMilliseconds(10);
 
 /// UTF-8 to the NUL-terminated UTF-16 CF_UNICODETEXT wants, with every bare LF turned into
 /// CRLF on the way.
-fn clipboardUnitsFromUtf8(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
+pub fn clipboardUnitsFromUtf8(allocator: std.mem.Allocator, text: []const u8) ![:0]u16 {
     var crlf: std.ArrayList(u8) = .empty;
     defer crlf.deinit(allocator);
     try crlf.ensureTotalCapacity(allocator, text.len + 1);
@@ -1009,7 +1104,7 @@ fn clipboardUnitsFromUtf8(allocator: std.mem.Allocator, text: []const u8) ![:0]u
 }
 
 /// CF_UNICODETEXT (up to its NUL) to UTF-8, with CRLF folded back to LF.
-fn utf8FromClipboardUnits(allocator: std.mem.Allocator, units: []const u16) ![]u8 {
+pub fn utf8FromClipboardUnits(allocator: std.mem.Allocator, units: []const u16) ![]u8 {
     const terminated = std.mem.sliceTo(units, 0);
     const utf8 = std.unicode.utf16LeToUtf8Alloc(allocator, terminated) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -1063,16 +1158,134 @@ test "clipboard entry points compile" {
         _ = &Window.getClipboardText;
         _ = &Window.setPrimaryText;
         _ = &Window.getPrimaryText;
+        _ = &Window.setDropTarget;
+        _ = &Window.takeDrop;
+        _ = &Window.startDrag;
         _ = &windowProc;
     }
+}
+
+// A drag from one of our windows onto itself, through OLE's own loop: the pointer is warped into the client area and a button pressed with synthetic input, the drag is started, then the button released; the window must see the hover, the drop with the payload, and the finish. Runs under Wine, whose `DoDragDrop` loops over its own message queue.
+test "a drag from the window onto itself delivers text and files through OLE" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var wm = try WindowManager.init(testing.io, .empty, testing.allocator);
+    defer wm.deinit();
+    var window = try wm.createWindow(.{ .title = "mir drop", .x = 100, .y = 100, .width = 320, .height = 240 });
+    defer window.deinit();
+    try window.show();
+    // The window manager may still be placing the window; the pointer must land where it ends up.
+    try testing.io.sleep(settle, .awake);
+    try window.setDropTarget(.{ .text = true, .files = true });
+    try testing.expectError(error.NoDrop, window.takeDrop(testing.allocator));
+
+    // No button is down, so there is nothing to hang a drag on.
+    try testing.expectError(error.DragNoButton, window.startDrag(.{ .text = "x" }));
+
+    try dragOntoSelf(&window, .{ .text = "hello\ndrop é" }, .text);
+    const text = try window.takeDrop(testing.allocator);
+    defer text.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello\ndrop é", text.text);
+    try testing.expectError(error.NoDrop, window.takeDrop(testing.allocator));
+
+    try dragOntoSelf(&window, .{ .files = &.{ "C:\\Users\\mir\\a b.txt", "D:\\y.png" } }, .files);
+    const files = try window.takeDrop(testing.allocator);
+    defer files.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), files.files.len);
+    try testing.expectEqualStrings("C:\\Users\\mir\\a b.txt", files.files[0]);
+    try testing.expectEqualStrings("D:\\y.png", files.files[1]);
+
+    // A window taking nothing refuses the hover: no events, and the drag ends unaccepted.
+    try window.setDropTarget(.{});
+    try pressInside(&window);
+    try window.startDrag(.{ .text = "refused" });
+    try testing.expectError(error.DragInProgress, window.startDrag(.{ .text = "again" }));
+    try testing.io.sleep(settle, .awake);
+    sendMouse(win.MOUSEEVENTF_MOVE);
+    sendMouse(win.MOUSEEVENTF_MOVE);
+    sendMouse(win.MOUSEEVENTF_LEFTUP);
+    const refused = try awaitEvent(.drag_finished, &.{ .drag_enter, .drag_motion, .drop });
+    try testing.expect(!refused.drag_finished.accepted);
+    try testing.expectError(error.NoDrop, window.takeDrop(testing.allocator));
+}
+
+const settle = std.Io.Duration.fromMilliseconds(300);
+const poll_interval = std.Io.Duration.fromMilliseconds(10);
+/// Five seconds of `poll_interval`, the most a drag step is waited for.
+const await_polls = 500;
+const nudge_limit = 100;
+const polls_per_nudge = 5;
+
+/// Press the left button in the middle of the client area and wait for the window to see it.
+fn pressInside(window: *Window) !void {
+    var origin = win.Point{ .x = 0, .y = 0 };
+    _ = win.ClientToScreen(window.handle, &origin);
+    _ = win.SetCursorPos(origin.x + 100, origin.y + 80);
+    sendMouse(win.MOUSEEVENTF_LEFTDOWN);
+    _ = try awaitEvent(.mouse_pressed, &.{});
+}
+
+/// A whole drag of `data` onto the window: the hover must arrive as `kind`, then the drop, then the finish saying it was taken.
+fn dragOntoSelf(window: *Window, data: common.DragData, kind: common.DropKind) !void {
+    try pressInside(window);
+    try window.startDrag(data);
+    // OLE reports the hover on the next mouse message, so nudge the pointer until it does.
+    const enter = try nudgeUntil(.drag_enter, &.{ .drop, .drag_finished });
+    try testing.expectEqual(kind, enter.drag_enter.kind);
+    sendMouse(win.MOUSEEVENTF_MOVE);
+    sendMouse(win.MOUSEEVENTF_LEFTUP);
+    const dropped = try awaitEvent(.drop, &.{.drag_finished});
+    try testing.expectEqual(kind, dropped.drop.kind);
+    try testing.expect(dropped.drop.x > 0 and dropped.drop.y > 0);
+    const finished = try awaitEvent(.drag_finished, &.{});
+    try testing.expect(finished.drag_finished.accepted);
+}
+
+/// Move the pointer a pixel at a time until `wanted` arrives; a `forbidden` event fails.
+fn nudgeUntil(comptime wanted: std.meta.Tag(common.Event), comptime forbidden: []const std.meta.Tag(common.Event)) !common.Event {
+    var nudges: u32 = 0;
+    while (nudges < nudge_limit) : (nudges += 1) {
+        sendMouse(win.MOUSEEVENTF_MOVE);
+        var polls: u32 = 0;
+        while (polls < polls_per_nudge) : (polls += 1) {
+            if (events.pull()) |event| {
+                inline for (forbidden) |tag| if (event == tag) return error.UnexpectedEvent;
+                if (event == wanted) return event;
+                continue;
+            }
+            try testing.io.sleep(poll_interval, .awake);
+        }
+    }
+    return error.EventTimeout;
+}
+
+/// The next `wanted` event within `await_polls`, skipping the rest; a `forbidden` one fails.
+fn awaitEvent(comptime wanted: std.meta.Tag(common.Event), comptime forbidden: []const std.meta.Tag(common.Event)) !common.Event {
+    var polls: u32 = 0;
+    while (polls < await_polls) : (polls += 1) {
+        if (events.pull()) |event| {
+            inline for (forbidden) |tag| if (event == tag) return error.UnexpectedEvent;
+            if (event == wanted) return event;
+            continue;
+        }
+        try testing.io.sleep(poll_interval, .awake);
+    }
+    return error.EventTimeout;
+}
+
+fn sendMouse(flags: u32) void {
+    const move = flags == win.MOUSEEVENTF_MOVE;
+    const inputs = [_]win.Input{.{ .mouse = .{ .dx = if (move) 1 else 0, .dy = 0, .flags = flags } }};
+    _ = win.SendInput(inputs.len, &inputs, @sizeOf(win.Input));
 }
 
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const win = @import("windows");
+const ole = win.ole;
 const common = @import("common.zig");
 const queue = @import("queue.zig");
 const keys = @import("keys.zig");
+const win32_drag = @import("win32_drag.zig");
 
 const log = std.log.scoped(.any_win32);

@@ -87,11 +87,712 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("frame pacing: unsupported on this backend\n", .{});
     }
 
-    // Last: it runs the reader on a task, and canceling that mid-message would
+    // Last: these run the reader on a task, and canceling that mid-message would
     // confuse the synchronous pumps above.
     try verifyClipboard(io, environ, allocator, &wm, &window);
+    try verifyDragAndDrop(io, environ, allocator, &wm, &window);
 
     std.debug.print("verify: ok\n", .{});
+}
+
+/// Drag and drop on X11, both roles. As a target, against a bare XDND peer on
+/// its own connection: a file list through the three types XdndEnter carries,
+/// five types through XdndTypeList, a text-only source, a leave, a source that
+/// never answers the ConvertSelection (refused within about a second, and the
+/// next drop works), and a window that takes nothing (refused, no event). As a
+/// source, against a GTK 3 window (the embedded `verify_drop_target.py`): text,
+/// a file list, and a release over the root; then a self drop into a second
+/// window of our own. The pointer is not needed: XDND is ClientMessage traffic,
+/// and the rig injects the source's motion and release at its own window
+/// through the server, as `verifyKeys` does for keys. The reader runs on a task
+/// meanwhile and logs every event.
+fn verifyDragAndDrop(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator, wm: *win.WindowManager, window: *win.Window) !void {
+    const backend = switch (wm.*) {
+        .x11 => |*x11_backend| x11_backend,
+        .wayland => {
+            std.debug.print("drag and drop: not driven on Wayland (no input injection protocol); see the plan's checklist\n", .{});
+            return;
+        },
+    };
+    const window_id = window.x11.window_id;
+
+    var events = EventLog{ .allocator = allocator };
+    defer events.deinit();
+    var reader = try io.concurrent(dragReaderLoop, .{ io, wm, &events });
+    defer reader.cancel(io);
+
+    try window.setDropTarget(.{ .text = true, .files = true });
+    var peer = try Peer.init(io, environ, allocator);
+    defer peer.deinit(io);
+    const centre = try peer.centreOf(io, window_id);
+    std.debug.print("drag: our window's centre in root coordinates: {d}, {d}\n", .{ centre.x, centre.y });
+
+    // 1. A file list, the uri-list among the three types the enter carries.
+    {
+        const dropped = try dropFromPeer(io, allocator, &peer, &events, window, centre, .{
+            .types = &.{ peer.atoms.uri_list, peer.atoms.mime_utf8, peer.atoms.utf8_string },
+            .answer_target = peer.atoms.uri_list,
+            .answer = "file:///tmp/a.txt\r\nfile:///tmp/b%20c.txt\r\nhttps://example.com/\r\n",
+        });
+        defer dropped.deinit(allocator);
+        try expectFiles(dropped, &.{ "/tmp/a.txt", "/tmp/b c.txt" });
+        std.debug.print("drag: files from a bare peer: ok\n", .{});
+    }
+
+    // 2. Five types, the uri-list beyond the third so only XdndTypeList finds it.
+    {
+        const dropped = try dropFromPeer(io, allocator, &peer, &events, window, centre, .{
+            .types = &.{ peer.atoms.string, peer.atoms.text, peer.atoms.utf8_string, peer.atoms.uri_list, peer.atoms.mime_utf8 },
+            .answer_target = peer.atoms.uri_list,
+            .answer = "file:///home/x/one\r\n",
+        });
+        defer dropped.deinit(allocator);
+        try expectFiles(dropped, &.{"/home/x/one"});
+        std.debug.print("drag: files through XdndTypeList: ok\n", .{});
+    }
+
+    // 3. A text-only source: the best text type is asked for.
+    {
+        const dropped = try dropFromPeer(io, allocator, &peer, &events, window, centre, .{
+            .types = &.{ peer.atoms.string, peer.atoms.text, peer.atoms.utf8_string },
+            .answer_target = peer.atoms.utf8_string,
+            .answer = "hello from the peer",
+        });
+        defer dropped.deinit(allocator);
+        if (dropped != .text or !std.mem.eql(u8, dropped.text, "hello from the peer")) return error.DropTextMismatch;
+        std.debug.print("drag: text from a bare peer: ok\n", .{});
+    }
+
+    // 4. Enter, position, leave: drag_enter then drag_leave, nothing else.
+    {
+        try peer.enter(io, window_id, &.{ peer.atoms.utf8_string, 0, 0 });
+        try peer.position(io, window_id, centre);
+        const status = try peer.awaitStatus(io, window_id);
+        if (!status.accept) return error.DropRefused;
+        _ = try events.expect(io, .drag_enter, "leave test");
+        try peer.leave(io, window_id);
+        _ = try events.expect(io, .drag_leave, "leave test");
+        try events.expectNone(io, "after a leave");
+        std.debug.print("drag: leave: ok\n", .{});
+    }
+
+    // 5. A source that never answers the ConvertSelection: refused within about
+    // a second, drag_leave, and the next drop works.
+    {
+        try peer.enter(io, window_id, &.{ peer.atoms.utf8_string, 0, 0 });
+        try peer.position(io, window_id, centre);
+        _ = try peer.awaitStatus(io, window_id);
+        _ = try events.expect(io, .drag_enter, "silent source");
+        try peer.drop(io, window_id);
+        const started = std.Io.Clock.now(.awake, io);
+        const finished = try peer.awaitFinished(io, window_id, 3000);
+        if (finished.accepted) return error.SilentSourceAccepted;
+        const waited_ms = @divTrunc(started.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds, std.time.ns_per_ms);
+        _ = try events.expect(io, .drag_leave, "silent source");
+        std.debug.print("drag: silent source refused after {d} ms: ok\n", .{waited_ms});
+        peer.drain(io);
+        const dropped = try dropFromPeer(io, allocator, &peer, &events, window, centre, .{
+            .types = &.{ peer.atoms.utf8_string, 0, 0 },
+            .answer_target = peer.atoms.utf8_string,
+            .answer = "after the silence",
+        });
+        defer dropped.deinit(allocator);
+        if (dropped != .text or !std.mem.eql(u8, dropped.text, "after the silence")) return error.DropTextMismatch;
+        std.debug.print("drag: the drop after a silent source: ok\n", .{});
+    }
+
+    // 6. A window that takes nothing: XdndStatus refuses and no event goes out.
+    {
+        try window.setDropTarget(.{});
+        try peer.enter(io, window_id, &.{ peer.atoms.uri_list, peer.atoms.utf8_string, 0 });
+        try peer.position(io, window_id, centre);
+        const status = try peer.awaitStatus(io, window_id);
+        if (status.accept) return error.RefusalExpected;
+        try peer.leave(io, window_id);
+        try events.expectNone(io, "a window taking nothing");
+        try window.setDropTarget(.{ .text = true, .files = true });
+        std.debug.print("drag: a window taking nothing refuses: ok\n", .{});
+    }
+
+    // 7. Source against a GTK 3 window: text, a file list, then a release over the root.
+    try verifyDragToGtk(io, allocator, backend, &peer, &events, window);
+
+    // 8. Self drop: our source into a second window of ours, both halves in one process.
+    {
+        var second = try wm.createWindow(.{ .title = "anywindow-verify-target", .width = 200, .height = 200, .x = 400, .y = 10 });
+        defer second.deinit();
+        try second.show();
+        try second.setDropTarget(.{ .text = true });
+        try io.sleep(std.Io.Duration.fromMilliseconds(300), .awake);
+        peer.drain(io);
+        const second_centre = try peer.centreOf(io, second.x11.window_id);
+        try window.startDrag(.{ .text = "self drop" });
+        try injectMotion(io, backend, window, second_centre);
+        try io.sleep(std.Io.Duration.fromMilliseconds(50), .awake);
+        try injectMotion(io, backend, window, .{ .x = second_centre.x + 1, .y = second_centre.y });
+        _ = try events.expect(io, .drag_enter, "self drop");
+        _ = try events.expect(io, .drag_motion, "self drop");
+        try injectRelease(io, backend, window, second_centre);
+        _ = try events.expect(io, .drop, "self drop");
+        const dropped = try second.takeDrop(allocator);
+        defer dropped.deinit(allocator);
+        if (dropped != .text or !std.mem.eql(u8, dropped.text, "self drop")) return error.DropTextMismatch;
+        const finished = try events.expect(io, .drag_finished, "self drop");
+        if (!finished.drag_finished.accepted) return error.SelfDropRefused;
+        std.debug.print("drag: self drop into a second window: ok\n", .{});
+    }
+}
+
+/// The source half against GTK: the peer script opens a window that takes text
+/// and URIs and prints each drop; the rig drags into it with injected motion.
+fn verifyDragToGtk(io: std.Io, allocator: std.mem.Allocator, backend: *win.x11.WindowManager, peer: *Peer, events: *EventLog, window: *win.Window) !void {
+    // WAYLAND_DISPLAY is unset for an X11 run, but libwayland falls back to wayland-0 on its
+    // own, so GTK is told which backend to use.
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "env", "GDK_BACKEND=x11", "python3", "-c", gtk_peer_script },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    }) catch |err| {
+        std.debug.print("drag: GTK peer could not start ({any}); source checks against GTK skipped\n", .{err});
+        return;
+    };
+    var child_running = true;
+    defer if (child_running) child.kill(io);
+    var lines = LineLog{ .allocator = allocator };
+    defer lines.deinit();
+    var output = try io.concurrent(peerOutputLoop, .{ io, child.stdout.?, &lines });
+    defer output.cancel(io);
+
+    const ready = lines.next(io, 5000) orelse {
+        std.debug.print("drag: GTK peer never said ready; source checks against GTK skipped\n", .{});
+        return;
+    };
+    defer allocator.free(ready);
+    if (!std.mem.startsWith(u8, ready, "ready ")) return error.GtkPeerUnexpectedOutput;
+    const gtk_window = try std.fmt.parseInt(u32, ready["ready ".len..], 10);
+    // The window manager maps it a moment after GTK asks.
+    try io.sleep(std.Io.Duration.fromMilliseconds(500), .awake);
+    peer.drain(io);
+    const centre = try peer.centreOf(io, gtk_window);
+    std.debug.print("drag: GTK window 0x{x} centred at {d}, {d}\n", .{ gtk_window, centre.x, centre.y });
+
+    // Text.
+    try window.startDrag(.{ .text = "text from mir" });
+    try dragTo(io, backend, window, centre);
+    try expectLine(io, allocator, &lines, "text: text from mir");
+    var finished = try events.expect(io, .drag_finished, "text to GTK");
+    if (!finished.drag_finished.accepted) return error.GtkDragRefused;
+    std.debug.print("drag: text into GTK: ok\n", .{});
+
+    // Files.
+    try window.startDrag(.{ .files = &.{ "/tmp/mir one.txt", "/tmp/two" } });
+    try dragTo(io, backend, window, centre);
+    try expectLine(io, allocator, &lines, "files: /tmp/mir one.txt /tmp/two");
+    finished = try events.expect(io, .drag_finished, "files to GTK");
+    if (!finished.drag_finished.accepted) return error.GtkDragRefused;
+    std.debug.print("drag: files into GTK: ok\n", .{});
+
+    // Escape over GTK: the drag ends refused, GTK prints nothing, and the next drag works.
+    if (findKeysym(backend, keysym_escape, 0)) |escape| {
+        try window.startDrag(.{ .text = "cancelled" });
+        try injectMotion(io, backend, window, centre);
+        try io.sleep(std.Io.Duration.fromMilliseconds(100), .awake);
+        try injectKey(io, backend, window, escape);
+        finished = try events.expect(io, .drag_finished, "escape over GTK");
+        if (finished.drag_finished.accepted) return error.EscapeAccepted;
+        if (lines.next(io, 300)) |line| {
+            defer allocator.free(line);
+            std.debug.print("drag: GTK printed \"{s}\" after an escape\n", .{line});
+            return error.GtkPeerMismatch;
+        }
+        std.debug.print("drag: escape over GTK: ok\n", .{});
+    } else {
+        std.debug.print("drag: no Escape in the keymap, cancel skipped\n", .{});
+    }
+
+    // A release over the root, where nothing takes drops.
+    try window.startDrag(.{ .text = "nowhere" });
+    try dragTo(io, backend, window, .{ .x = 5, .y = 600 });
+    finished = try events.expect(io, .drag_finished, "release over the root");
+    if (finished.drag_finished.accepted) return error.RootDropAccepted;
+    std.debug.print("drag: release over the root refused: ok\n", .{});
+
+    child.stdin.?.close(io);
+    child.stdin = null;
+    _ = try child.wait(io);
+    child_running = false;
+}
+
+/// Move the (synthetic) pointer to `point` in two steps and release the button there.
+fn dragTo(io: std.Io, backend: *win.x11.WindowManager, window: *win.Window, point: Point) !void {
+    try injectMotion(io, backend, window, .{ .x = point.x - 1, .y = point.y });
+    try io.sleep(std.Io.Duration.fromMilliseconds(50), .awake);
+    try injectMotion(io, backend, window, point);
+    try io.sleep(std.Io.Duration.fromMilliseconds(100), .awake);
+    try injectRelease(io, backend, window, point);
+}
+
+/// A MotionNotify at our window in root coordinates, as the grab task would forward.
+fn injectMotion(io: std.Io, backend: *win.x11.WindowManager, window: *win.Window, point: Point) !void {
+    const event = x11.proto.MotionNotify{
+        .detail = .Normal,
+        .sequence_number = 0,
+        .time = 0,
+        .root_window = window.x11.root,
+        .event_window = window.x11.window_id,
+        .child_window = 0,
+        .root_x = point.x,
+        .root_y = point.y,
+        .event_x = 0,
+        .event_y = 0,
+        .state = @intFromEnum(x11.proto.KeyButMask.Button1),
+        .same_screen = 1,
+        .pad = .{0},
+    };
+    try x11.send(io, backend.conn, x11.proto.SendEvent{ .destination = window.x11.window_id, .event_mask = 0, .event = std.mem.toBytes(event) });
+}
+
+/// A KeyPress at our window, as `expectTyped` sends them.
+fn injectKey(io: std.Io, backend: *win.x11.WindowManager, window: *win.Window, press: Press) !void {
+    const event = x11.proto.KeyPress{
+        .keycode = press.keycode,
+        .sequence_number = 0,
+        .time = 0,
+        .root_window = window.x11.root,
+        .event_window = window.x11.window_id,
+        .child_window = 0,
+        .root_x = 0,
+        .root_y = 0,
+        .event_x = 0,
+        .event_y = 0,
+        .state = press.state,
+        .same_screen = 1,
+        .pad = .{0},
+    };
+    try x11.send(io, backend.conn, x11.proto.SendEvent{ .destination = window.x11.window_id, .event_mask = 0, .event = std.mem.toBytes(event) });
+}
+
+fn injectRelease(io: std.Io, backend: *win.x11.WindowManager, window: *win.Window, point: Point) !void {
+    const event = x11.proto.ButtonRelease{
+        .keycode = 1,
+        .sequence_number = 0,
+        .time = 0,
+        .root_window = window.x11.root,
+        .event_window = window.x11.window_id,
+        .child_window = 0,
+        .root_x = point.x,
+        .root_y = point.y,
+        .event_x = 0,
+        .event_y = 0,
+        .state = @intFromEnum(x11.proto.KeyButMask.Button1),
+        .same_screen = 1,
+        .pad = .{0},
+    };
+    try x11.send(io, backend.conn, x11.proto.SendEvent{ .destination = window.x11.window_id, .event_mask = 0, .event = std.mem.toBytes(event) });
+}
+
+const gtk_peer_script = @embedFile("verify_drop_target.py");
+
+const Point = struct { x: i16, y: i16 };
+
+const PeerDrop = struct {
+    /// Up to three types in the enter; more go through XdndTypeList.
+    types: []const u32,
+    answer_target: u32,
+    answer: []const u8,
+};
+
+/// One drop from the bare peer: enter (through the type list when there are
+/// more than three types), one position, the status, the drop, the peer's
+/// answer to our ConvertSelection, XdndFinished, and the payload taken here.
+fn dropFromPeer(io: std.Io, allocator: std.mem.Allocator, peer: *Peer, events: *EventLog, window: *win.Window, centre: Point, drop: PeerDrop) !win.DropData {
+    const window_id = window.x11.window_id;
+    if (drop.types.len > 3) {
+        try peer.setTypeList(io, drop.types);
+        try peer.enterWithList(io, window_id, drop.types[0..3]);
+    } else {
+        var three: [3]u32 = .{ 0, 0, 0 };
+        @memcpy(three[0..drop.types.len], drop.types);
+        try peer.enter(io, window_id, &three);
+    }
+    try peer.position(io, window_id, centre);
+    const status = try peer.awaitStatus(io, window_id);
+    if (!status.accept) return error.DropRefused;
+    const entered = try events.expect(io, .drag_enter, "peer drop");
+    // The root centre of a 320x240 window is its (160, 120) once the origin is taken off.
+    if (entered.drag_enter.x != 160 or entered.drag_enter.y != 120) {
+        std.debug.print("drag: drag_enter at {d}, {d}, expected 160, 120\n", .{ entered.drag_enter.x, entered.drag_enter.y });
+        return error.DropPositionWrong;
+    }
+    try peer.position(io, window_id, .{ .x = centre.x + 2, .y = centre.y + 3 });
+    _ = try peer.awaitStatus(io, window_id);
+    const moved = try events.expect(io, .drag_motion, "peer drop");
+    if (moved.drag_motion.x != entered.drag_enter.x + 2 or moved.drag_motion.y != entered.drag_enter.y + 3) return error.DropPositionWrong;
+    try peer.drop(io, window_id);
+    const request = try peer.awaitSelectionRequest(io);
+    if (request.target != drop.answer_target) {
+        std.debug.print("drag: our target asked for atom {d}, expected {d}\n", .{ request.target, drop.answer_target });
+        return error.DropTargetMismatch;
+    }
+    try peer.answer(io, request, drop.answer);
+    const finished = try peer.awaitFinished(io, window_id, 3000);
+    if (!finished.accepted) return error.DropNotAccepted;
+    const dropped = try events.expect(io, .drop, "peer drop");
+    if (dropped.drop.x != moved.drag_motion.x or dropped.drop.y != moved.drag_motion.y) return error.DropPositionWrong;
+    return window.takeDrop(allocator);
+}
+
+fn expectFiles(dropped: win.DropData, expected: []const []const u8) !void {
+    if (dropped != .files or dropped.files.len != expected.len) {
+        std.debug.print("drag: expected {d} files, got {s} with {d} entries\n", .{ expected.len, @tagName(dropped), if (dropped == .files) dropped.files.len else 0 });
+        return error.DropFilesMismatch;
+    }
+    for (dropped.files, expected) |path, want| {
+        if (!std.mem.eql(u8, path, want)) {
+            std.debug.print("drag: got path \"{s}\", expected \"{s}\"\n", .{ path, want });
+            return error.DropFilesMismatch;
+        }
+    }
+}
+
+/// A bare XDND source on a connection of its own: a 1x1 window, the atoms, and
+/// the messages a source sends and expects.
+const Peer = struct {
+    conn: std.Io.net.Stream,
+    info: x11.Setup,
+    window: u32,
+    root: u32,
+    atoms: Atoms,
+
+    const Atoms = struct {
+        atom: u32,
+        xdnd_selection: u32,
+        enter: u32,
+        position: u32,
+        status: u32,
+        leave: u32,
+        drop: u32,
+        finished: u32,
+        type_list: u32,
+        action_copy: u32,
+        uri_list: u32,
+        mime_utf8: u32,
+        utf8_string: u32,
+        string: u32,
+        text: u32,
+    };
+
+    fn init(io: std.Io, environ: std.process.Environ, allocator: std.mem.Allocator) !Peer {
+        const conn = try x11.connect(io, environ, .{});
+        errdefer conn.close(io);
+        const info = try x11.setup(io, environ, allocator, conn);
+        errdefer info.deinit();
+        var xid = x11.XID.init(info.resource_id_base, info.resource_id_mask);
+        const peer_window = try xid.genID();
+        const values = x11.proto.WindowValue{ .BackgroundPixel = 0 };
+        try x11.sendWithValues(io, conn, x11.proto.CreateWindow{
+            .window_id = peer_window,
+            .parent_id = info.screens[0].root,
+            .visual_id = info.screens[0].root_visual,
+            .depth = info.screens[0].root_depth,
+            .x = 0,
+            .y = 0,
+            .width = 1,
+            .height = 1,
+            .border_width = 0,
+            .window_class = .InputOutput,
+            .value_mask = x11.maskFromValues(x11.proto.WindowMask, values),
+        }, values);
+        const atoms = Atoms{
+            .atom = try x11.internAtom(io, conn, "ATOM"),
+            .xdnd_selection = try x11.internAtom(io, conn, x11.xdnd.Atom.selection),
+            .enter = try x11.internAtom(io, conn, x11.xdnd.Atom.enter),
+            .position = try x11.internAtom(io, conn, x11.xdnd.Atom.position),
+            .status = try x11.internAtom(io, conn, x11.xdnd.Atom.status),
+            .leave = try x11.internAtom(io, conn, x11.xdnd.Atom.leave),
+            .drop = try x11.internAtom(io, conn, x11.xdnd.Atom.drop),
+            .finished = try x11.internAtom(io, conn, x11.xdnd.Atom.finished),
+            .type_list = try x11.internAtom(io, conn, x11.xdnd.Atom.type_list),
+            .action_copy = try x11.internAtom(io, conn, x11.xdnd.Atom.action_copy),
+            .uri_list = try x11.internAtom(io, conn, "text/uri-list"),
+            .mime_utf8 = try x11.internAtom(io, conn, "text/plain;charset=utf-8"),
+            .utf8_string = try x11.internAtom(io, conn, "UTF8_STRING"),
+            .string = try x11.internAtom(io, conn, "STRING"),
+            .text = try x11.internAtom(io, conn, "TEXT"),
+        };
+        try x11.send(io, conn, x11.proto.SetSelectionOwner{ .owner = peer_window, .selection = atoms.xdnd_selection });
+        return .{ .conn = conn, .info = info, .window = peer_window, .root = info.screens[0].root, .atoms = atoms };
+    }
+
+    fn deinit(self: *Peer, io: std.Io) void {
+        self.info.deinit();
+        self.conn.close(io);
+    }
+
+    /// The centre of `window` in root coordinates, read with TranslateCoordinates
+    /// and GetGeometry; nothing else may be pending on the connection.
+    fn centreOf(self: *Peer, io: std.Io, window: u32) !Point {
+        try x11.send(io, self.conn, x11.proto.GetGeometry{ .drawable = window });
+        const geometry = (try x11.receiveReply(io, self.conn, x11.proto.GetGeometryReply)) orelse return error.PeerRequestFailed;
+        try x11.send(io, self.conn, x11.proto.TranslateCoordinates{ .src_window = window, .dst_window = self.root, .src_x = 0, .src_y = 0 });
+        const origin = (try x11.receiveReply(io, self.conn, x11.proto.TranslateCoordinatesReply)) orelse return error.PeerRequestFailed;
+        return .{
+            .x = @intCast(@as(i32, origin.dst_x) + @divTrunc(geometry.width, 2)),
+            .y = @intCast(@as(i32, origin.dst_y) + @divTrunc(geometry.height, 2)),
+        };
+    }
+
+    fn sendMessage(self: *Peer, io: std.Io, destination: u32, message_type: u32, data: [5]u32) !void {
+        const event = x11.proto.ClientMessageEvent{ .window_id = destination, .message_type = message_type, .data = data };
+        try x11.send(io, self.conn, x11.proto.SendEvent{ .destination = destination, .event_mask = 0, .event = std.mem.toBytes(event) });
+    }
+
+    fn enter(self: *Peer, io: std.Io, target: u32, types: *const [3]u32) !void {
+        try self.sendMessage(io, target, self.atoms.enter, (x11.xdnd.Enter{ .source = self.window, .version = 5, .more_types = false, .types = types.* }).pack());
+    }
+
+    fn enterWithList(self: *Peer, io: std.Io, target: u32, first: []const u32) !void {
+        var three: [3]u32 = .{ 0, 0, 0 };
+        @memcpy(three[0..first.len], first);
+        try self.sendMessage(io, target, self.atoms.enter, (x11.xdnd.Enter{ .source = self.window, .version = 5, .more_types = true, .types = three }).pack());
+    }
+
+    fn setTypeList(self: *Peer, io: std.Io, types: []const u32) !void {
+        try x11.sendWithBytes(io, self.conn, x11.proto.ChangeProperty{
+            .window_id = self.window,
+            .property = self.atoms.type_list,
+            .property_type = self.atoms.atom,
+            .format = 32,
+            .length_of_data = @intCast(types.len),
+        }, std.mem.sliceAsBytes(types));
+    }
+
+    fn position(self: *Peer, io: std.Io, target: u32, point: Point) !void {
+        try self.sendMessage(io, target, self.atoms.position, (x11.xdnd.Position{ .source = self.window, .root_x = point.x, .root_y = point.y, .time = 0, .action = self.atoms.action_copy }).pack());
+    }
+
+    fn leave(self: *Peer, io: std.Io, target: u32) !void {
+        try self.sendMessage(io, target, self.atoms.leave, (x11.xdnd.Leave{ .source = self.window }).pack());
+    }
+
+    fn drop(self: *Peer, io: std.Io, target: u32) !void {
+        try self.sendMessage(io, target, self.atoms.drop, (x11.xdnd.Drop{ .source = self.window, .time = 0 }).pack());
+    }
+
+    /// Write the answer to a SelectionRequest and notify the requestor.
+    fn answer(self: *Peer, io: std.Io, request: x11.proto.SelectionRequest, bytes: []const u8) !void {
+        const property = if (request.property != 0) request.property else request.target;
+        try x11.sendWithBytes(io, self.conn, x11.proto.ChangeProperty{
+            .window_id = request.requestor,
+            .property = property,
+            .property_type = request.target,
+            .format = 8,
+            .length_of_data = @intCast(bytes.len),
+        }, bytes);
+        const notify = x11.proto.SelectionNotify{
+            .time = request.time,
+            .requestor = request.requestor,
+            .selection = request.selection,
+            .target = request.target,
+            .property = property,
+        };
+        try x11.send(io, self.conn, x11.proto.SendEvent{ .destination = request.requestor, .event_mask = 0, .event = std.mem.toBytes(notify) });
+    }
+
+    fn awaitStatus(self: *Peer, io: std.Io, target: u32) !x11.xdnd.Status {
+        const status = x11.xdnd.Status.unpack(try self.awaitClientMessage(io, self.atoms.status, 3000));
+        if (status.target != target) return error.StatusFromWrongWindow;
+        return status;
+    }
+
+    fn awaitFinished(self: *Peer, io: std.Io, target: u32, timeout_ms: u32) !x11.xdnd.Finished {
+        const finished = x11.xdnd.Finished.unpack(try self.awaitClientMessage(io, self.atoms.finished, timeout_ms));
+        if (finished.target != target) return error.FinishedFromWrongWindow;
+        return finished;
+    }
+
+    /// The next ClientMessage of `message_type`; everything else on the way is dropped.
+    fn awaitClientMessage(self: *Peer, io: std.Io, message_type: u32, timeout_ms: u32) ![5]u32 {
+        const deadline = deadlineIn(io, timeout_ms);
+        while (true) {
+            const message = try x11.receive(io, self.conn, .{ .deadline = deadline }) orelse return error.PeerTimeout;
+            switch (message) {
+                .ClientMessage => |client_message| {
+                    if (client_message.data_Type == message_type and client_message.format == 32) return x11.clientMessageData(client_message).u32;
+                },
+                .Reply => |reply| try skipReply(io, self.conn, reply.extraLength()),
+                .ErrorMessage => |failure| std.debug.print("drag: X11 error at the peer: {any}\n", .{failure.error_code}),
+                else => {},
+            }
+        }
+    }
+
+    fn awaitSelectionRequest(self: *Peer, io: std.Io) !x11.proto.SelectionRequest {
+        const deadline = deadlineIn(io, 3000);
+        while (true) {
+            const message = try x11.receive(io, self.conn, .{ .deadline = deadline }) orelse return error.PeerTimeout;
+            switch (message) {
+                .SelectionRequest => |request| return request,
+                .Reply => |reply| try skipReply(io, self.conn, reply.extraLength()),
+                else => {},
+            }
+        }
+    }
+
+    /// Read whatever is queued so a naive reply read is safe.
+    fn drain(self: *Peer, io: std.Io) void {
+        while (true) {
+            const message = x11.receive(io, self.conn, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch return;
+            const received = message orelse return;
+            if (received == .Reply) skipReply(io, self.conn, received.Reply.extraLength()) catch return;
+        }
+    }
+};
+
+fn deadlineIn(io: std.Io, milliseconds: u32) std.Io.Clock.Timestamp {
+    return std.Io.Clock.now(.awake, io).addDuration(.fromMilliseconds(milliseconds)).withClock(.awake);
+}
+
+fn skipReply(io: std.Io, conn: std.Io.net.Stream, count: usize) !void {
+    var scratch: [256]u8 = undefined;
+    var left = count;
+    while (left > 0) {
+        const chunk = scratch[0..@min(left, scratch.len)];
+        try x11.receiveBytes(io, conn, chunk);
+        left -= chunk.len;
+    }
+}
+
+/// Every event the reader task saw, for the main thread to inspect.
+const EventLog = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    events: std.ArrayList(win.Event) = .empty,
+    taken: usize = 0,
+
+    fn deinit(self: *EventLog) void {
+        self.events.deinit(self.allocator);
+    }
+
+    fn push(self: *EventLog, io: std.Io, event: win.Event) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.events.append(self.allocator, event) catch {};
+    }
+
+    /// The next drag event, waiting up to `timeout_ms`; other kinds are skipped.
+    fn nextDragEvent(self: *EventLog, io: std.Io, timeout_ms: u32) ?win.Event {
+        var waited: u32 = 0;
+        while (true) {
+            {
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                while (self.taken < self.events.items.len) {
+                    const event = self.events.items[self.taken];
+                    self.taken += 1;
+                    switch (event) {
+                        .drag_enter, .drag_motion, .drag_leave, .drop, .drag_finished => return event,
+                        else => {},
+                    }
+                }
+            }
+            if (waited >= timeout_ms) return null;
+            io.sleep(std.Io.Duration.fromMilliseconds(20), .awake) catch return null;
+            waited += 20;
+        }
+    }
+
+    fn expect(self: *EventLog, io: std.Io, tag: std.meta.Tag(win.Event), what: []const u8) !win.Event {
+        const event = self.nextDragEvent(io, 3000) orelse {
+            std.debug.print("drag: {s}: no {s} event within 3 s\n", .{ what, @tagName(tag) });
+            return error.DragEventMissing;
+        };
+        if (event != tag) {
+            std.debug.print("drag: {s}: got {s}, expected {s}\n", .{ what, @tagName(event), @tagName(tag) });
+            return error.DragEventMismatch;
+        }
+        return event;
+    }
+
+    fn expectNone(self: *EventLog, io: std.Io, what: []const u8) !void {
+        if (self.nextDragEvent(io, 300)) |event| {
+            std.debug.print("drag: {s}: unexpected {s} event\n", .{ what, @tagName(event) });
+            return error.DragEventUnexpected;
+        }
+    }
+};
+
+fn dragReaderLoop(io: std.Io, wm: *win.WindowManager, events: *EventLog) void {
+    while (true) {
+        const event = wm.receiveIo(io) catch return;
+        if (event) |received| events.push(io, received);
+    }
+}
+
+/// Lines a child process printed, for the main thread to wait on.
+const LineLog = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Io.Mutex = .init,
+    lines: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *LineLog) void {
+        for (self.lines.items) |line| self.allocator.free(line);
+        self.lines.deinit(self.allocator);
+    }
+
+    fn push(self: *LineLog, io: std.Io, line: []const u8) void {
+        const copy = self.allocator.dupe(u8, line) catch return;
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.lines.append(self.allocator, copy) catch self.allocator.free(copy);
+    }
+
+    /// The oldest line not yet taken, owned by the caller, waiting up to `timeout_ms`.
+    fn next(self: *LineLog, io: std.Io, timeout_ms: u32) ?[]u8 {
+        var waited: u32 = 0;
+        while (true) {
+            {
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+                if (self.lines.items.len > 0) return self.lines.orderedRemove(0);
+            }
+            if (waited >= timeout_ms) return null;
+            io.sleep(std.Io.Duration.fromMilliseconds(20), .awake) catch return null;
+            waited += 20;
+        }
+    }
+};
+
+fn peerOutputLoop(io: std.Io, file: std.Io.File, lines: *LineLog) void {
+    var pending: [4096]u8 = undefined;
+    var pending_len: usize = 0;
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        const count = file.readStreaming(io, &.{&chunk}) catch return;
+        if (count == 0) return;
+        for (chunk[0..count]) |byte| {
+            if (byte == '\n') {
+                lines.push(io, pending[0..pending_len]);
+                pending_len = 0;
+            } else if (pending_len < pending.len) {
+                pending[pending_len] = byte;
+                pending_len += 1;
+            }
+        }
+    }
+}
+
+fn expectLine(io: std.Io, allocator: std.mem.Allocator, lines: *LineLog, expected: []const u8) !void {
+    const line = lines.next(io, 5000) orelse {
+        std.debug.print("drag: GTK printed nothing, expected \"{s}\"\n", .{expected});
+        return error.GtkPeerSilent;
+    };
+    defer allocator.free(line);
+    if (!std.mem.eql(u8, line, expected)) {
+        std.debug.print("drag: GTK printed \"{s}\", expected \"{s}\"\n", .{ line, expected });
+        return error.GtkPeerMismatch;
+    }
 }
 
 /// The clipboard many ways: our text served to a foreign client (wl-paste or

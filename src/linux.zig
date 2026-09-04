@@ -189,6 +189,35 @@ pub const Window = union(enum) {
         }
     }
 
+    /// Take drops of the given kinds, delivered as `drag_enter`, `drag_motion`, `drag_leave`
+    /// and `drop` events. Off by default; `.{}` turns it off again. `error.DragUnsupported`
+    /// when the platform has nothing to register with.
+    pub fn setDropTarget(self: *@This(), kinds: common.DropKinds) common.DragError!void {
+        switch (self.*) {
+            inline else => |*window| return window.setDropTarget(kinds),
+        }
+    }
+
+    /// The newest drop's payload, copied into `allocator`; the stored one is freed. A drop
+    /// nobody took is freed by the next. `error.NoDrop` when nothing is pending.
+    pub fn takeDrop(self: *@This(), allocator: std.mem.Allocator) (common.DropError || std.mem.Allocator.Error)!common.DropData {
+        switch (self.*) {
+            inline else => |*window| return window.takeDrop(allocator),
+        }
+    }
+
+    /// Start dragging `data` out of this window. Call it while a mouse button is held over
+    /// the window, from the handling of that press or the motion that follows; the drag
+    /// ends when the button is released and `drag_finished` reports the outcome. `data` is
+    /// copied before this returns. `error.DragNoButton` when no press is current,
+    /// `error.DragInProgress` while a drag from this process runs, `error.DragUnsupported`
+    /// when the platform cannot drag.
+    pub fn startDrag(self: *@This(), data: common.DragData) common.DragError!void {
+        switch (self.*) {
+            inline else => |*window| return window.startDrag(data),
+        }
+    }
+
     pub fn beginDraw(self: *@This()) !void {
         switch (self.*) {
             inline else => |*window| return window.beginDraw(),

@@ -90,6 +90,26 @@ pub const WindowManager = struct {
     /// Tasks writing our selection texts into receivers' pipes; reaped as
     /// they finish, canceled in deinit. Receive-task only.
     send_tasks: std.ArrayList(*SendTask) = .empty,
+    /// Tasks reading dropped offers' pipes; each ends by posting a sync
+    /// callback `receiveIo` finishes the drop on. Receive-task only.
+    receive_tasks: std.ArrayList(*wayland_drag.ReceiveTask) = .empty,
+
+    // Drag and drop, guarded by state_mutex.
+    /// The drag over one of our surfaces, from `enter` until `leave` or `drop`.
+    drag_target: ?wayland_drag.DropTarget = null,
+    /// The newest drop's payload until `takeDrop` moves it out.
+    pending_drop: ?common.DropData = null,
+    /// Sync-callback id to the `ReceiveTask` that posted it, its bytes in hand.
+    drop_callbacks: std.AutoHashMapUnmanaged(u32, *wayland_drag.ReceiveTask) = .empty,
+    /// The drag this process started, if one runs.
+    drag_source: ?wayland_drag.DragSource = null,
+    /// The last pointer press: its serial, surface and button. `start_drag`
+    /// needs exactly the serial of the press whose implicit grab is in
+    /// progress (`input_serial` is overwritten by keys and releases), so it is
+    /// recorded apart and cleared when that button comes up.
+    pointer_press_serial: u32 = 0,
+    pointer_press_surface: u32 = 0,
+    pointer_press_button: u32 = 0,
 
     state_mutex: std.Io.Mutex = .init,
     window_objects: std.AutoHashMapUnmanaged(u32, *WindowShared) = .empty,
@@ -220,6 +240,9 @@ pub const WindowManager = struct {
 
     pub fn deinit(self: *@This()) void {
         self.stopRepeat();
+        self.reapReceiveTasks();
+        self.receive_tasks.deinit(self.allocator);
+        self.releaseDrag();
         self.reapSendTasks(.cancel);
         self.send_tasks.deinit(self.allocator);
         self.releaseSelections();
@@ -229,6 +252,7 @@ pub const WindowManager = struct {
         self.frame_callbacks.deinit(self.allocator);
         self.close_callbacks.deinit(self.allocator);
         self.repeat_callbacks.deinit(self.allocator);
+        self.drop_callbacks.deinit(self.allocator);
         self.outputs.deinit(self.allocator);
         self.pending_resizes.deinit(self.allocator);
         self.pending_scale_changes.deinit(self.allocator);
@@ -437,6 +461,9 @@ pub const WindowManager = struct {
                         .window_id = held.window_id,
                     } };
                 }
+                if (self.drop_callbacks.fetchRemove(done.callback_id)) |entry| {
+                    return self.finishDropLocked(entry.value);
+                }
                 return null;
             },
             .pointer_enter => |enter| {
@@ -468,6 +495,7 @@ pub const WindowManager = struct {
             .pointer_button => |button| {
                 self.input_serial.store(button.serial, .monotonic);
                 const focus = self.pointerFocus() orelse return null;
+                self.notePress(io, button.serial, focus, button.button, button.state == proto.wayland.state_pressed);
                 const mapped = buttonFromEvdev(button.button);
                 if (button.state == proto.wayland.state_pressed) {
                     return .{ .mouse_pressed = .{ .x = self.pointer_x, .y = self.pointer_y, .button = mapped, .window_id = focus } };
@@ -597,13 +625,53 @@ pub const WindowManager = struct {
             },
             .data_device_selection => |selection| return self.noteSelection(io, .clipboard, selection.offer),
             .data_source_send => |send| {
-                self.serveSend(io, .clipboard, send.source, send.fd);
+                if (self.isDragSource(io, send.source)) {
+                    // A drag payload that cannot be copied is not served at all; closing the fd tells the target so.
+                    if (self.dragPayload(io, send.source, send.mime)) |bytes| {
+                        self.serveBytes(io, bytes, send.fd);
+                    } else {
+                        _ = std.os.linux.close(send.fd);
+                    }
+                } else {
+                    self.serveSend(io, .clipboard, send.source, send.fd);
+                }
                 return null;
             },
             .data_source_cancelled => |source| {
+                if (self.isDragSource(io, source)) return self.finishDrag(io, source, false);
                 self.noteCancelled(io, .clipboard, source);
                 return null;
             },
+            .data_device_enter => |enter| return self.noteDragEnter(io, enter),
+            .data_device_leave => return self.noteDragLeave(io),
+            .data_device_motion => |motion| return self.noteDragMotion(io, motion),
+            .data_device_drop => {
+                self.noteDragDrop(io);
+                return null;
+            },
+            .data_offer_source_actions => |actions| return self.noteSourceActions(io, actions.offer, actions.actions),
+            .data_offer_action => |action| {
+                self.noteOfferAction(io, action.offer, action.action);
+                return null;
+            },
+            // Without an icon there is no feedback to update; the outcome comes as finished or cancelled.
+            .data_source_target => |target| {
+                log.debug("Drag target takes {s}", .{if (target.mime.len == 0) "nothing" else target.mime});
+                return null;
+            },
+            .data_source_action => |action| {
+                log.debug("Drag action settled on {d}", .{action.action});
+                return null;
+            },
+            .data_source_drop_performed => |source| {
+                self.state_mutex.lockUncancelable(io);
+                defer self.state_mutex.unlock(io);
+                if (self.drag_source) |*drag| {
+                    if (drag.id == source) drag.dropped = true;
+                }
+                return null;
+            },
+            .data_source_finished => |source| return self.finishDrag(io, source, true),
             .primary_offer_new => |new| {
                 self.noteOfferNew(io, .primary, new.offer);
                 return null;
@@ -683,6 +751,365 @@ pub const WindowManager = struct {
         self.state_mutex.lockUncancelable(io);
         defer self.state_mutex.unlock(io);
         if (self.stateOf(kind).source == source) self.dropSourceLocked(kind);
+    }
+
+    // Drag and drop: the target side. Receive-task only unless noted.
+
+    /// Remember a pointer press for `startDrag`, and forget it when that button comes up.
+    fn notePress(self: *@This(), io: std.Io, serial: u32, surface: common.WindowID, button: u32, pressed: bool) void {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        if (pressed) {
+            self.pointer_press_serial = serial;
+            self.pointer_press_surface = @intCast(surface);
+            self.pointer_press_button = button;
+        } else if (self.pointer_press_button == button) {
+            self.pointer_press_serial = 0;
+            self.pointer_press_surface = 0;
+        }
+    }
+
+    /// A drag came over `enter.surface` carrying `enter.offer`, which was announced like a selection offer. Decide what to take from the window's kinds, tell the compositor, and report `drag_enter` when something is.
+    fn noteDragEnter(self: *@This(), io: std.Io, enter: @FieldType(wl.Event, "data_device_enter")) !?common.Event {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        // A compositor that forgot to send leave: end the old hover first, in order.
+        if (self.drag_target) |old| {
+            self.drag_target = null;
+            self.destroyDragOfferLocked(old.offer);
+            if (old.entered()) self.queued.push(.{ .drag_leave = old.window_id });
+        }
+
+        const clipboard = self.stateOf(.clipboard);
+        var announced: Offer = .{ .id = enter.offer };
+        if (clipboard.pending_offer) |pending| {
+            if (pending.id == enter.offer) {
+                announced = pending;
+                clipboard.pending_offer = null;
+            }
+        }
+        const shared: ?*WindowShared = if (self.window_objects.get(enter.surface)) |shared| (if (shared.surface == enter.surface) shared else null) else null;
+        const kinds: common.DropKinds = if (shared) |window| window.drop_kinds else .{};
+        const scale120: u32 = if (shared) |window| window.scale120 else 120;
+        const choice = wayland_drag.choose(kinds, announced.uri_list, announced.mime, announced.source_actions);
+        self.drag_target = .{
+            .offer = enter.offer,
+            .window_id = enter.surface,
+            .serial = enter.serial,
+            .choice = choice,
+            .scale120 = scale120,
+            .x = coordinate(enter.x, scale120),
+            .y = coordinate(enter.y, scale120),
+        };
+        if (enter.offer != 0) try self.answerOfferLocked(enter.offer, enter.serial, choice);
+
+        const chosen = choice orelse return self.queued.pop();
+        self.queued.push(.{ .drag_enter = .{ .x = self.drag_target.?.x, .y = self.drag_target.?.y, .kind = chosen.kind, .window_id = enter.surface } });
+        return self.queued.pop();
+    }
+
+    /// Tell the compositor what we take from `offer`: the mime type, or nothing, and on version 3 the copy action or none. Requires state_mutex.
+    fn answerOfferLocked(self: *@This(), offer: u32, serial: u32, choice: ?wayland_drag.Choice) !void {
+        const version = self.stateOf(.clipboard).manager_version;
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            try proto.data_device.offer.accept(writer, offer, serial, if (choice) |chosen| chosen.mime else null);
+            if (version >= 3) {
+                const action: u32 = if (choice != null) proto.data_device.dnd_action_copy else proto.data_device.dnd_action_none;
+                try proto.data_device.offer.setActions(writer, offer, action, action);
+            }
+        }
+        try self.display.flush();
+    }
+
+    /// The source's allowed actions arrived, before `enter` (on the offer still being announced) or during the hover. A source that forbids copy cannot be copied from, so the hover becomes a refusal.
+    fn noteSourceActions(self: *@This(), io: std.Io, offer: u32, actions: u32) !?common.Event {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        if (self.stateOf(.clipboard).pending_offer) |*pending| {
+            if (pending.id == offer) pending.source_actions = actions;
+        }
+        if (self.drag_target == null) return null;
+        const target = &self.drag_target.?;
+        if (target.offer != offer) return null;
+        if (actions & proto.data_device.dnd_action_copy != 0) return null;
+        if (target.choice == null) return null;
+        target.choice = null;
+        try self.answerOfferLocked(offer, target.serial, null);
+        return .{ .drag_leave = target.window_id };
+    }
+
+    /// The action the compositor settled on; version 3 lets `finish` go out only after one other than none arrived.
+    fn noteOfferAction(self: *@This(), io: std.Io, offer: u32, action: u32) void {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        if (self.drag_target == null) return;
+        const target = &self.drag_target.?;
+        if (target.offer != offer) return;
+        if (action != proto.data_device.dnd_action_none) target.action_received = true;
+    }
+
+    fn noteDragMotion(self: *@This(), io: std.Io, motion: @FieldType(wl.Event, "data_device_motion")) ?common.Event {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        if (self.drag_target == null) return null;
+        const target = &self.drag_target.?;
+        target.x = coordinate(motion.x, target.scale120);
+        target.y = coordinate(motion.y, target.scale120);
+        if (!target.entered()) return null;
+        return .{ .drag_motion = .{ .x = target.x, .y = target.y, .window_id = target.window_id } };
+    }
+
+    /// The drag left without dropping, or the session ended after a drop already handed the offer to a receive task (then there is nothing left to do). The offer is ours to destroy.
+    fn noteDragLeave(self: *@This(), io: std.Io) ?common.Event {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        const target = self.drag_target orelse return null;
+        self.drag_target = null;
+        self.destroyDragOfferLocked(target.offer);
+        if (!target.entered()) return null;
+        return .{ .drag_leave = target.window_id };
+    }
+
+    /// The user released over the window. A refused drag is over (the compositor cancels the source); an accepted one has its bytes read by a task, which ends the hover with `drop` or `drag_leave` when it is done.
+    fn noteDragDrop(self: *@This(), io: std.Io) void {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        const target = self.drag_target orelse return;
+        self.drag_target = null;
+        const choice = target.choice orelse {
+            self.destroyDragOfferLocked(target.offer);
+            return;
+        };
+        // finish needs version 3 and an action the compositor settled on; without either the source is left to its own timeout rather than risk a protocol error.
+        const finish_allowed = self.stateOf(.clipboard).manager_version >= 3 and target.action_received;
+        self.receiveDropLocked(io, target, choice, finish_allowed) catch |err| {
+            log.warn("Drop could not be received: {any}", .{err});
+            self.destroyDragOfferLocked(target.offer);
+            if (target.entered()) self.queued.push(.{ .drag_leave = target.window_id });
+        };
+    }
+
+    /// Ask the offer for `choice.mime` into a pipe and start the task that reads it. Requires state_mutex.
+    fn receiveDropLocked(self: *@This(), io: std.Io, target: wayland_drag.DropTarget, choice: wayland_drag.Choice, finish_allowed: bool) !void {
+        var pipe: [2]i32 = undefined;
+        switch (std.os.linux.errno(std.os.linux.pipe2(&pipe, .{ .CLOEXEC = true }))) {
+            .SUCCESS => {},
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+        const read_end = pipe[0];
+        errdefer _ = std.os.linux.close(read_end);
+        {
+            // The compositor forwards the write end to the source; ours must go, or the pipe never reports end of file.
+            var buffer: [64]u8 = undefined;
+            const message = try proto.data_device.offer.receiveMessage(&buffer, target.offer, choice.mime);
+            const sent = self.display.sendWithFd(message, pipe[1]);
+            _ = std.os.linux.close(pipe[1]);
+            try sent;
+        }
+
+        const task = try self.allocator.create(wayland_drag.ReceiveTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{
+            .fd = read_end,
+            .offer = target.offer,
+            .kind = choice.kind,
+            .window_id = target.window_id,
+            .x = target.x,
+            .y = target.y,
+            .finish_allowed = finish_allowed,
+        };
+        try self.receive_tasks.append(self.allocator, task);
+        task.future = io.concurrent(wayland_drag.ReceiveTask.run, .{ task, self.allocator, self }) catch |err| {
+            // Without concurrency the read happens here; the source is committed and writing, and the sync it posts comes back through the loop as usual.
+            log.debug("Drop receive task unavailable ({any}); reading inline", .{err});
+            self.state_mutex.unlock(io);
+            defer self.state_mutex.lockUncancelable(io);
+            wayland_drag.ReceiveTask.run(task, self.allocator, self);
+            return;
+        };
+    }
+
+    /// Called by a `ReceiveTask` with its bytes in hand: register a sync callback for it and send the sync, so `receiveIo` finishes the drop on `callback_done`.
+    pub fn postDropCallback(self: *@This(), task: *wayland_drag.ReceiveTask) !void {
+        const callback_id = try self.display.newId(.callback);
+        {
+            self.state_mutex.lockUncancelable(self.io);
+            defer self.state_mutex.unlock(self.io);
+            try self.drop_callbacks.put(self.allocator, callback_id, task);
+        }
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            try proto.wayland.display.sync(writer, callback_id);
+        }
+        try self.display.flush();
+    }
+
+    /// The receive task's bytes are in: decode them, tell the compositor the transfer is done (or not), store the payload for `takeDrop` and report `drop`; a failed or empty transfer cancels the source and ends the hover with `drag_leave`. Requires state_mutex.
+    fn finishDropLocked(self: *@This(), task: *wayland_drag.ReceiveTask) ?common.Event {
+        defer self.retireReceiveTask(task);
+        const decoded: ?common.DropData = if (task.outcome == .received)
+            wayland_drag.decode(self.allocator, task.kind, task.data.items) catch null
+        else
+            null;
+        const payload = decoded orelse {
+            log.debug("Drop {s}; refusing", .{@tagName(task.outcome)});
+            self.destroyDragOfferLocked(task.offer);
+            return .{ .drag_leave = task.window_id };
+        };
+        if (task.finish_allowed) {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            proto.data_device.offer.finish(writer, task.offer) catch {};
+        }
+        self.destroyDragOfferLocked(task.offer);
+        if (self.pending_drop) |old| old.deinit(self.allocator);
+        self.pending_drop = payload;
+        return .{ .drop = .{ .x = task.x, .y = task.y, .kind = task.kind, .window_id = task.window_id } };
+    }
+
+    /// Wait for a receive task's last steps and free it. The task posted its callback as its final act, so this never waits long.
+    fn retireReceiveTask(self: *@This(), task: *wayland_drag.ReceiveTask) void {
+        for (self.receive_tasks.items, 0..) |candidate, index| {
+            if (candidate != task) continue;
+            _ = self.receive_tasks.swapRemove(index);
+            break;
+        }
+        if (task.future) |*future| future.await(self.io);
+        task.deinit(self.allocator);
+        self.allocator.destroy(task);
+    }
+
+    /// Stop every receive task at deinit; their offers go with the connection.
+    fn reapReceiveTasks(self: *@This()) void {
+        for (self.receive_tasks.items) |task| {
+            task.stop.store(true, .release);
+            if (task.future) |*future| future.cancel(self.io);
+            task.deinit(self.allocator);
+            self.allocator.destroy(task);
+        }
+        self.receive_tasks.clearRetainingCapacity();
+    }
+
+    /// Destroy a drag offer and forget its server-created id; 0 stands for a drag that carried none. Requires state_mutex.
+    fn destroyDragOfferLocked(self: *@This(), offer: u32) void {
+        if (offer == 0) return;
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            proto.data_device.offer.destroy(writer, offer) catch {};
+        }
+        self.display.forgetServerObject(offer);
+        self.display.flush() catch {};
+    }
+
+    /// The newest drop's payload, copied into `allocator`; the stored one is freed.
+    fn takeDrop(self: *@This(), allocator: std.mem.Allocator) (common.DropError || std.mem.Allocator.Error)!common.DropData {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        const stored = self.pending_drop orelse return error.NoDrop;
+        const taken = try stored.dupe(allocator);
+        stored.deinit(self.allocator);
+        self.pending_drop = null;
+        return taken;
+    }
+
+    // Drag and drop: the source side.
+
+    /// Whether `source` is the drag source, told apart from the clipboard's by id.
+    fn isDragSource(self: *@This(), io: std.Io, source: u32) bool {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        const drag = self.drag_source orelse return false;
+        return drag.id == source;
+    }
+
+    /// A copy of what the drag source serves for `mime`, or null when `source` is not it or it never offered `mime`.
+    fn dragPayload(self: *@This(), io: std.Io, source: u32, mime: []const u8) ?[]u8 {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        const drag = self.drag_source orelse return null;
+        if (drag.id != source) return null;
+        const bytes = drag.payloadFor(mime) orelse return null;
+        return self.allocator.dupe(u8, bytes) catch null;
+    }
+
+    /// Our drag ended: the target finished with it (`accepted`) or the compositor cancelled it. Destroy the source and report `drag_finished`.
+    fn finishDrag(self: *@This(), io: std.Io, source: u32, accepted: bool) ?common.Event {
+        self.state_mutex.lockUncancelable(io);
+        defer self.state_mutex.unlock(io);
+        const drag = self.drag_source orelse return null;
+        if (drag.id != source) return null;
+        self.dropDragSourceLocked();
+        return .{ .drag_finished = .{ .accepted = accepted, .window_id = drag.window_id } };
+    }
+
+    /// Destroy the drag source and free its payload. Requires state_mutex.
+    fn dropDragSourceLocked(self: *@This()) void {
+        const drag = self.drag_source orelse return;
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            proto.data_device.source.destroy(writer, drag.id) catch {};
+        }
+        self.display.flush() catch {};
+        self.allocator.free(drag.bytes);
+        self.drag_source = null;
+    }
+
+    /// Start dragging `data` out of `window_id`; see `Window.startDrag`. Any thread.
+    fn startDrag(self: *@This(), window_id: common.WindowID, data: common.DragData) common.DragError!void {
+        const clipboard = self.stateOf(.clipboard);
+        // Only version 3 tells a source how its drag ended (dnd_finished), and every compositor in use offers it.
+        if (clipboard.device == 0 or clipboard.manager_version < 3) return error.DragUnsupported;
+
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        if (self.drag_source != null) return error.DragInProgress;
+        const surface: u32 = @intCast(window_id);
+        if (self.pointer_press_serial == 0 or self.pointer_press_surface != surface) return error.DragNoButton;
+        const shared = self.window_objects.get(surface) orelse return error.DragNoButton;
+        const serial = self.pointer_press_serial;
+
+        const bytes = wayland_drag.renderPayload(self.allocator, data) catch return error.OutOfMemory;
+        errdefer self.allocator.free(bytes);
+        const source = self.display.newId(.data_source) catch return error.DragUnsupported;
+        self.drag_source = .{ .id = source, .window_id = window_id, .bytes = bytes, .files = data == .files };
+        {
+            const writer = self.display.acquire();
+            defer self.display.release();
+            self.marshalStartDrag(writer, clipboard, source, shared.surface, serial, data == .files) catch {
+                self.drag_source = null;
+                return error.DragUnsupported;
+            };
+        }
+        self.display.flush() catch {
+            self.drag_source = null;
+            return error.DragUnsupported;
+        };
+    }
+
+    fn marshalStartDrag(_: *@This(), writer: *std.Io.Writer, clipboard: *SelectionState, source: u32, origin: u32, serial: u32, files: bool) !void {
+        try proto.data_device.manager.createDataSource(writer, clipboard.manager, source);
+        if (files) try proto.data_device.source.offer(writer, source, proto.data_device.mime_uri_list);
+        for (proto.data_device.text_mime_types) |mime| {
+            try proto.data_device.source.offer(writer, source, mime);
+        }
+        try proto.data_device.source.setActions(writer, source, proto.data_device.dnd_action_copy);
+        try proto.data_device.device.startDrag(writer, clipboard.device, source, origin, 0, serial);
+    }
+
+    /// Give the drag objects back before the connection closes: a live target's offer, the payload nobody took, and our own source.
+    fn releaseDrag(self: *@This()) void {
+        self.state_mutex.lockUncancelable(self.io);
+        defer self.state_mutex.unlock(self.io);
+        if (self.drag_target) |target| self.destroyDragOfferLocked(target.offer);
+        self.drag_target = null;
+        if (self.pending_drop) |payload| payload.deinit(self.allocator);
+        self.pending_drop = null;
+        self.dropDragSourceLocked();
     }
 
     /// Begin auto-repeating a pressed key: remember it and start the task
@@ -1002,7 +1429,11 @@ pub const WindowManager = struct {
             _ = std.os.linux.close(fd);
             return;
         };
+        self.serveBytes(io, bytes, fd);
+    }
 
+    /// Write `bytes` (ours, freed by the task) into `fd` and close it, on a task of its own. Receive-task only.
+    fn serveBytes(self: *@This(), io: std.Io, bytes: []u8, fd: std.posix.fd_t) void {
         self.reapSendTasks(.finished);
         const task = self.allocator.create(SendTask) catch {
             _ = std.os.linux.close(fd);
@@ -1174,11 +1605,16 @@ fn receiveMessage(buffer: []u8, kind: common.Selection, offer: u32, mime: []cons
     };
 }
 
-/// A selection offer the compositor announced: its server-created id and the
-/// best text mime type it carries, as an index into `text_mime_types`.
+/// A selection or drag offer the compositor announced: its server-created id
+/// and the best text mime type it carries, as an index into `text_mime_types`.
 const Offer = struct {
     id: u32,
     mime: ?usize = null,
+    /// The offer carries `text/uri-list`: a file drag.
+    uri_list: bool = false,
+    /// The `dnd_action` bits the drag source allows, once its
+    /// `source_actions` arrived; null until then (and always for a selection).
+    source_actions: ?u32 = null,
     /// How many mime types were announced, and whether so far they are
     /// exactly `text_mime_types` in order — the shape of our own sources.
     announced: usize = 0,
@@ -1188,6 +1624,10 @@ const Offer = struct {
         const expected = if (self.announced < proto.data_device.text_mime_types.len) proto.data_device.text_mime_types[self.announced] else "";
         if (!std.mem.eql(u8, expected, name)) self.ours = false;
         self.announced += 1;
+        if (std.mem.eql(u8, name, proto.data_device.mime_uri_list)) {
+            self.uri_list = true;
+            return;
+        }
         for (proto.data_device.text_mime_types, 0..) |candidate, index| {
             if (!std.mem.eql(u8, candidate, name)) continue;
             if (self.mime == null or index < self.mime.?) self.mime = index;
@@ -1255,6 +1695,16 @@ test "Offer recognizes the exact mime list our sources announce" {
     try testing.expectEqual(@as(?usize, 0), reordered.mime);
 }
 
+test "Offer notes a uri-list without mistaking it for text or for ours" {
+    var offer = Offer{ .id = 0xff000005 };
+    offer.noteMime("text/uri-list");
+    try testing.expect(offer.uri_list);
+    try testing.expectEqual(@as(?usize, null), offer.mime);
+    for (proto.data_device.text_mime_types) |mime| offer.noteMime(mime);
+    try testing.expectEqual(@as(?usize, 0), offer.mime);
+    try testing.expect(!offer.looksLikeOurs());
+}
+
 /// A key being auto-repeated: what the original press reported, re-emitted
 /// with `repeat = true` on every tick.
 const HeldKey = struct {
@@ -1300,6 +1750,9 @@ const WindowShared = struct {
     /// Set by `requestFrame`, cleared when the next `present` asks the
     /// compositor for a frame callback. One-shot, as the Wayland callback is.
     frame_requested: bool = false,
+    /// What drags over this window are taken; nothing by default. The
+    /// compositor sends `enter` regardless, and this decides the answer.
+    drop_kinds: common.DropKinds = .{},
 
     /// XRGB shadow framebuffer all drawing lands in; width*height*4.
     shadow: []u8,
@@ -1427,6 +1880,14 @@ pub const Window = struct {
         defer wm.state_mutex.unlock(wm.io);
         const shared = self.shared;
 
+        // A drag hovering the window goes with it; the compositor's leave for a destroyed surface would find nothing.
+        if (wm.drag_target) |target| {
+            if (target.window_id == self.window_id) {
+                wm.drag_target = null;
+                wm.destroyDragOfferLocked(target.offer);
+            }
+        }
+
         var index = shared.slots.items.len;
         while (index > 0) {
             index -= 1;
@@ -1520,6 +1981,35 @@ pub const Window = struct {
     /// contract as `getClipboardText`.
     pub fn getPrimaryText(self: *@This(), allocator: std.mem.Allocator) ![]u8 {
         return self.wm.paste(allocator, .primary);
+    }
+
+    /// Take drops of the given kinds; `.{}` turns them off again. Nothing
+    /// goes to the compositor: it announces every drag, and the kinds decide
+    /// the answer. `error.DragUnsupported` without a data device (no
+    /// `wl_data_device_manager`, or no seat).
+    pub fn setDropTarget(self: *@This(), kinds: common.DropKinds) common.DragError!void {
+        const wm = self.wm;
+        if (wm.stateOf(.clipboard).device == 0) return error.DragUnsupported;
+        wm.state_mutex.lockUncancelable(wm.io);
+        defer wm.state_mutex.unlock(wm.io);
+        self.shared.drop_kinds = kinds;
+    }
+
+    /// The newest drop's payload, copied into `allocator`; the stored one is
+    /// freed. `error.NoDrop` when none is pending.
+    pub fn takeDrop(self: *@This(), allocator: std.mem.Allocator) (common.DropError || std.mem.Allocator.Error)!common.DropData {
+        return self.wm.takeDrop(allocator);
+    }
+
+    /// Start dragging `data` out of this window. Call it while a mouse button
+    /// is held on the window: the compositor honours `start_drag` only for
+    /// the serial of the press whose grab is in progress, and there is no
+    /// press to name otherwise (`error.DragNoButton`). The drag ends when the
+    /// button is released; `drag_finished` reports whether a target took it.
+    /// `error.DragInProgress` while a drag of ours runs,
+    /// `error.DragUnsupported` without a version 3 data device.
+    pub fn startDrag(self: *@This(), data: common.DragData) common.DragError!void {
+        return self.wm.startDrag(self.window_id, data);
     }
 
     pub fn toggleFullscreen(self: *@This()) void {
@@ -2067,6 +2557,15 @@ test "clipboard entry points compile" {
     _ = &Window.getClipboardText;
     _ = &Window.setPrimaryText;
     _ = &Window.getPrimaryText;
+    _ = &Window.setDropTarget;
+    _ = &Window.takeDrop;
+    _ = &Window.startDrag;
+    _ = &Window.deinit;
+}
+
+// The drag paths against a scripted compositor, since the live one cannot be driven.
+test {
+    _ = @import("wayland_fake_compositor.zig");
 }
 
 const std = @import("std");
@@ -2077,5 +2576,6 @@ const common = @import("common.zig");
 const keys = @import("keys.zig");
 const Compose = @import("compose.zig");
 const EventQueue = @import("event_queue.zig");
+const wayland_drag = @import("wayland_drag.zig");
 
 const log = std.log.scoped(.any_wayland);
