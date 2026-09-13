@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     });
     const windows = windows_dep.module("windows");
 
-    const wayland_dep = b.dependency("mir_wayland", .{
+    const wayland_dep = b.dependency("waylandz", .{
         .target = target,
         .optimize = optimize,
     });

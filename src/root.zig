@@ -1,4 +1,4 @@
-// The X11 backend reads its keysym tables from mir-wayland's XKB code and z11 speaks Unix sockets, so like the Wayland backend it exists only on Linux; a Windows build must not analyze it.
+// The X11 backend reads its keysym tables from waylandz's XKB code and z11 speaks Unix sockets, so like the Wayland backend it exists only on Linux; a Windows build must not analyze it.
 pub const x11 = switch (builtin.os.tag) {
     .linux => @import("x11.zig"),
     else => struct {},

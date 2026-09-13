@@ -1,4 +1,4 @@
-//! Wayland backend adapter: maps mir-wayland's raw protocol onto the
+//! Wayland backend adapter: maps waylandz's raw protocol onto the
 //! anywindow WindowManager/Window/Image contract, mirroring how x11.zig
 //! wraps z11.
 //!
