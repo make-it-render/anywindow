@@ -6,17 +6,16 @@
     .paths = .{ "src", "build.zig", "build.zig.zon" },
     .dependencies = .{
         .windowz = .{
-            .url = "git+https://github.com/make-it-render/windowz#692d01c796cdfab044c77b815790368102e2c2e1",
-            .hash = "windowz-0.0.0-s8UrxQx6AACmld_zHl3a0O4UGBxXRVEudTkyaaNTdi-G",
+            .url = "git+https://github.com/make-it-render/windowz#69c6678533747dfc51981d801325b3b79e05cd49",
+            .hash = "windowz-0.0.0-s8Urxcu1AQDZBxAYK-rrUKQFEIKhx2YIh4eaRhdMyo2x",
         },
         .z11 = .{
-            .url = "git+https://github.com/make-it-render/z11#f1acdd7fa95de8114bb66b392f5502aebb789181",
-            .hash = "z11-0.0.0-yiytBAFFAQBuwrLjrlY29Tp54GUyj5BJotu-Xj8AseGB",
+            .url = "git+https://github.com/make-it-render/z11#eb55995087ea48610466551b90a9aaa5ca295d3e",
+            .hash = "z11-0.0.0-yiytBOVfAgBtHivDJ13HW-UweDFDRliEWnWkhYvUuVru",
         },
-        // Local path until waylandz gets its first push to
-        // github.com/make-it-render — switch to url+hash then.
         .waylandz = .{
-            .path = "../waylandz",
+            .url = "git+https://github.com/make-it-render/waylandz#510a337ee37f53f107ccef88cd2bd8acc0f0a05d",
+            .hash = "waylandz-0.0.0-2U8Ak0Y5BQB85x3pa86f7WT4QqBLpGMQ4AJik2MI35gQ",
         },
     },
 }
